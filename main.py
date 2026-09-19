@@ -267,23 +267,108 @@ def probe_login_status(session: requests.Session) -> bool:
         return False
 
 
+def build_headless_context_from_cookies(chrome_exe_path: str, cookies: list) -> "BrowserHolder":
+    """启动无头浏览器并注入本地cookie，返回holder；失败会抛异常"""
+    holder = BrowserHolder()
+    try:
+        holder.playwright = sync_playwright().start()
+        launch_opt = {"headless": True}
+        resolved = resolve_chrome_path(chrome_exe_path)
+        if resolved:
+            launch_opt["executable_path"] = resolved
+        else:
+            launch_opt["channel"] = "chrome"
+        holder.browser = holder.playwright.chromium.launch(**launch_opt)
+        holder.context = holder.browser.new_context(
+            viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
+        )
+        pw_cookies = []
+        for ck in cookies:
+            item = {
+                "name": ck["name"],
+                "value": ck["value"],
+                "domain": (ck.get("domain") or "").lstrip("."),
+                "path": ck.get("path") or "/",
+            }
+            exp = ck.get("expires")
+            try:
+                exp = float(exp)
+                if exp > 0:
+                    item["expires"] = int(exp)
+            except (TypeError, ValueError):
+                pass
+            pw_cookies.append(item)
+        holder.context.add_cookies(pw_cookies)
+        return holder
+    except Exception:
+        holder.close()
+        raise
+
+
+def probe_login_status_pw(context) -> bool:
+    """浏览器通道探测：用context.request请求首页检查登录标记（绕过WAF对requests的拦截）"""
+    try:
+        resp = context.request.get(BrowserConfig.HOME_URL, timeout=20 * 1000)
+        html = resp.text()
+        if "edit-password" in html or "logout" in html:
+            return True
+        if "phone_number" in html:
+            log_print(f"⚠️浏览器通道确认：首页显示未登录(status={resp.status})，本地cookie已失效")
+        else:
+            log_print(f"⚠️浏览器通道响应异常 status={resp.status}，按cookie失效处理")
+        return False
+    except Exception as e:
+        log_print(f"⚠️浏览器通道探测异常: {e}")
+        return False
+
+
 def get_valid_session(chrome_exe_path: str, phone: str, password: str):
-    """优先复用本地cookie（以服务端动态探测为准），失效才启动浏览器登录并更新本地cookie
-    返回(requests会话, 浏览器holder或None)；holder不为None时任务结束后必须close()"""
+    """获取(requests会话, 浏览器holder或None, prefer_pw是否跳过requests)：
+    - Windows：requests被WAF拦截，探测和爬取全部走浏览器通道（cookie有效时用无头浏览器，无需验证码）
+    - macOS等：requests优先，被拦截才回退浏览器通道"""
     saved_phone, saved = load_saved_cookies()
     if saved and saved_phone == phone.strip():
         if cookies_statically_expired(saved):
-            log_print("⚠️本地cookie的时间戳已过期，发起服务端探测确认是否真的失效")
-        session = build_session_from_cookies(saved)
-        if probe_login_status(session):
-            return session, None
-        log_print("本地cookie已失效，重新登录并更新本地文件")
+            log_print("⚠️本地cookie的时间戳已过期，发起探测确认是否真的失效")
+        if sys.platform == "win32":
+            holder = None
+            try:
+                holder = build_headless_context_from_cookies(chrome_exe_path, saved)
+                if probe_login_status_pw(holder.context):
+                    log_print("✅本地cookie有效（浏览器通道确认），使用无头浏览器通道爬取")
+                    return build_session_from_cookies(saved), holder, True
+                log_print("本地cookie已失效，重新登录并更新本地文件")
+            except Exception as e:
+                log_print(f"⚠️无头浏览器启动失败: {e}，重新登录")
+            finally:
+                if holder is not None:
+                    holder.close()
+        else:
+            session = build_session_from_cookies(saved)
+            if probe_login_status(session):
+                return session, None, False
+            log_print("本地cookie已失效，重新登录并更新本地文件")
     else:
         if saved:
             log_print("⚠️本地cookie属于其他账号，需要重新登录")
         else:
             log_print("本地无保存的cookie，需要登录")
-    return login_and_get_session(chrome_exe_path, phone, password)
+    session, holder = login_and_get_session(chrome_exe_path, phone, password)
+    # 登录完成、cookie已保存，立即关闭可见浏览器
+    if holder is not None:
+        holder.close()
+        holder = None
+        log_print("✅登录完成，浏览器窗口已关闭")
+    if sys.platform == "win32":
+        # Windows：requests被WAF拦截，用刚保存的cookie启动无头浏览器作为爬取通道
+        _, fresh = load_saved_cookies()
+        if fresh:
+            try:
+                holder = build_headless_context_from_cookies(chrome_exe_path, fresh)
+                log_print("✅已启动无头浏览器通道，开始爬取")
+            except Exception as e:
+                log_print(f"⚠️无头浏览器启动失败: {e}，本次爬取将无浏览器通道可用")
+    return session, holder, sys.platform == "win32"
 
 
 class BrowserHolder:
@@ -311,10 +396,12 @@ class BrowserHolder:
 class ApiClient:
     """接口请求封装：优先requests；返回被拦截(非JSON/异常HTML)时自动切换Playwright浏览器通道"""
 
-    def __init__(self, session: requests.Session = None, pw_context=None):
+    def __init__(self, session: requests.Session = None, pw_context=None, prefer_pw: bool = False):
         self.session = session
         self.pw_context = pw_context
-        self.use_pw = False  # True=后续全部走浏览器通道
+        self.use_pw = prefer_pw  # True=全程走浏览器通道（不尝试requests）
+        if prefer_pw:
+            log_print("接口请求直接使用浏览器通道（跳过requests）")
 
     @staticmethod
     def _looks_blocked(ct: str, body: str) -> bool:
@@ -553,8 +640,9 @@ def crawl_magazine_images(
     target_volume_name_text: str,
     save_root: str,
     pw_context=None,
+    prefer_pw: bool = False,
 ):
-    client = ApiClient(session, pw_context)
+    client = ApiClient(session, pw_context, prefer_pw=prefer_pw)
     ts = int(time.time() * 1000)
     search_url = (
         f"https://web.591adb.cn/search/hngymyzyxy.html?st=1&page_num=1"
@@ -840,7 +928,7 @@ def background_task(
         save_account(phone, password)
         log_print(f"🚀开始执行任务，数据目录:{DATA_DIR}")
         log_print("🚀开始执行任务，准备登录会话")
-        session, holder = get_valid_session(chrome_path, phone, password)
+        session, holder, prefer_pw = get_valid_session(chrome_path, phone, password)
         log_print("✅获取Cookie完成，开始爬取杂志图片")
 
         # 处理水印文件与页码（提前校验，避免下完图片才发现参数错误）
@@ -860,6 +948,7 @@ def background_task(
         for item in crawl_magazine_images(
             session=session,
             pw_context=holder.context if holder is not None else None,
+            prefer_pw=prefer_pw,
             keyword=book_name,
             target_year=year_str,
             target_volume_name_text=issue_str,
