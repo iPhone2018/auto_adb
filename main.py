@@ -375,16 +375,44 @@ class ApiClient:
         return None
 
 
+def resolve_chrome_path(chrome_exe_path: str) -> str:
+    """解析可用的Chrome路径：优先用户指定的；无效时尝试系统常见安装路径（mac/win）；都不存在返回空串"""
+    if chrome_exe_path and os.path.exists(chrome_exe_path):
+        return chrome_exe_path
+    candidates = []
+    if sys.platform == "win32":
+        candidates = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        ]
+    elif sys.platform == "darwin":
+        candidates = ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return ""
+
+
 def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
     """启动浏览器登录，返回(requests会话, 浏览器holder)；holder需在任务结束后close()"""
     holder = BrowserHolder()
     try:
         holder.playwright = sync_playwright().start()
         launch_opt = {"headless": False}
-        if chrome_exe_path and os.path.exists(chrome_exe_path):
-            launch_opt["executable_path"] = chrome_exe_path
+        resolved = resolve_chrome_path(chrome_exe_path)
+        if resolved:
+            launch_opt["executable_path"] = resolved
+            if chrome_exe_path and os.path.normpath(chrome_exe_path) != os.path.normpath(resolved):
+                log_print(f"⚠️指定的Chrome路径无效，自动使用: {resolved}")
+            else:
+                log_print(f"✅使用指定的Chrome: {resolved}")
         else:
             launch_opt["channel"] = "chrome"
+            if chrome_exe_path:
+                log_print(f"⚠️指定的Chrome路径不存在，改用系统Chrome: {chrome_exe_path}")
+            else:
+                log_print("未指定Chrome路径，使用系统Chrome")
         holder.browser = holder.playwright.chromium.launch(**launch_opt)
         holder.context = holder.browser.new_context(
             viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
@@ -608,6 +636,12 @@ def crawl_magazine_images(
     article_info_list = match_volume_rows(raw_year_blocks, target_year_set, target_volume_set)
     if not article_info_list:
         log_print(f"⚠️没有匹配到任何刊期，target_year={target_year}, volumes={target_volume_name_text}")
+        years_avail = [yb.get("item_year") for yb in raw_year_blocks]
+        log_print(f"   站点可用年份: {years_avail}")
+        for yb in raw_year_blocks:
+            if yb.get("item_year") in target_year_set:
+                vols = [r.get("volume") for r in yb.get("item_list", [])]
+                log_print(f"   {yb.get('item_year')} 年可用期刊: {vols}")
         return
 
     for item_info in article_info_list:
@@ -1123,6 +1157,12 @@ class App:
             if wm_pages:
                 messagebox.showerror("校验错误", "未选择水印文件，不允许填写水印页码")
                 return
+        chrome_path = self.chrome_path_var.get().strip()
+        if chrome_path and not os.path.exists(chrome_path):
+            if not resolve_chrome_path(""):
+                messagebox.showerror("校验错误", "指定的Chrome路径不存在，且未找到系统Chrome，请重新选择")
+                return
+            # 能找到系统默认Chrome：后台自动使用，并在日志中说明
 
         self.save_current_ui_config()
         self.set_ui_running_state(True)
