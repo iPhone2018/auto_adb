@@ -338,9 +338,10 @@ def get_valid_session(chrome_exe_path: str, phone: str, password: str):
                     log_print("✅本地cookie有效（浏览器通道确认），使用无头浏览器通道爬取")
                     return build_session_from_cookies(saved), holder, True
                 log_print("本地cookie已失效，重新登录并更新本地文件")
+                holder.close()
+                holder = None
             except Exception as e:
                 log_print(f"⚠️无头浏览器启动失败: {e}，重新登录")
-            finally:
                 if holder is not None:
                     holder.close()
         else:
