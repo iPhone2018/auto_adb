@@ -341,16 +341,17 @@ class ApiClient:
                     self.use_pw = True
             if self.pw_context is not None:
                 try:
-                    resp = self.pw_context.request.get(url, headers=headers or {}, timeout=timeout)
+                    # 注意：Playwright的timeout单位是毫秒
+                    resp = self.pw_context.request.get(url, headers=headers or {}, timeout=timeout * 1000)
                     body = resp.text()
                     if resp.ok and not self._looks_blocked(resp.headers.get("content-type"), body):
                         return body
-                    log_print(f"⚠️浏览器通道响应异常 status={resp.status}，第{attempt + 1}/{retries}次重试")
+                    log_print(f"⚠️浏览器通道响应异常 status={resp.status}，第{attempt + 1}/{retries + 1}次尝试")
                     log_print(f"   响应片段: {(body or '')[:200]}")
                 except Exception as e:
-                    log_print(f"⚠️浏览器通道请求异常:{e}，第{attempt + 1}/{retries}次重试")
+                    log_print(f"⚠️浏览器通道请求异常:{e}，第{attempt + 1}/{retries + 1}次尝试")
             else:
-                log_print(f"⚠️无浏览器通道可用，第{attempt + 1}/{retries}次放弃重试")
+                log_print(f"⚠️无浏览器通道可用，第{attempt + 1}/{retries + 1}次尝试")
             safe_sleep(2)
         return ""
 
@@ -365,7 +366,8 @@ class ApiClient:
                 self.use_pw = True
         if self.pw_context is not None:
             try:
-                resp = self.pw_context.request.get(url, timeout=timeout)
+                # 注意：Playwright的timeout单位是毫秒
+                resp = self.pw_context.request.get(url, timeout=timeout * 1000)
                 if resp.ok:
                     return resp.body()
             except Exception as e:
