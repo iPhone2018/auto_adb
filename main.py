@@ -16,10 +16,37 @@ from pypdf import PdfReader, PdfWriter, Transformation, PageObject
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ===================== 全局配置与存储路径 =====================
-ACCOUNT_STORE = "mag_account_store.json"
-CONFIG_STORE = "mag_config_store.json"
-COOKIE_STORE = "mag_cookies.json"
-LOG_FILE = "mag_run.log"
+def get_data_dir() -> str:
+    """数据文件(cookie/账号/配置/日志)存放目录：
+    优先用可执行文件所在目录（便携式）；不可写则回退到系统用户数据目录，兼容mac/win"""
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        exe_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        probe = os.path.join(exe_dir, ".write_test")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return exe_dir
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.path.expanduser("~")
+    data_dir = os.path.join(base, "杂志PDF下载工具")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+DATA_DIR = get_data_dir()
+ACCOUNT_STORE = os.path.join(DATA_DIR, "mag_account_store.json")
+CONFIG_STORE = os.path.join(DATA_DIR, "mag_config_store.json")
+COOKIE_STORE = os.path.join(DATA_DIR, "mag_cookies.json")
+LOG_FILE = os.path.join(DATA_DIR, "mag_run.log")
 TASK_STOP_EVENT = threading.Event()
 LOG_QUEUE = Queue()  # 无maxsize，put_nowait不会阻塞后台线程
 
@@ -230,7 +257,10 @@ def probe_login_status(session: requests.Session) -> bool:
         if "edit-password" in html or "logout" in html:
             log_print("✅本地cookie有效（服务端确认已登录），无需打开浏览器")
             return True
-        log_print("⚠️本地cookie未通过服务端验证，需要重新登录")
+        if "phone_number" in html:
+            log_print(f"⚠️首页显示未登录(status={resp.status_code})，本地cookie已失效，需要重新登录")
+        else:
+            log_print(f"⚠️首页响应异常(status={resp.status_code}, 长度={len(html)})，疑似被WAF拦截，按失效处理重新登录")
         return False
     except Exception as e:
         log_print(f"⚠️登录状态探测失败: {e}，将重新登录")
@@ -238,14 +268,15 @@ def probe_login_status(session: requests.Session) -> bool:
 
 
 def get_valid_session(chrome_exe_path: str, phone: str, password: str):
-    """优先复用本地cookie（以服务端动态探测为准），失效才启动浏览器登录并更新本地cookie"""
+    """优先复用本地cookie（以服务端动态探测为准），失效才启动浏览器登录并更新本地cookie
+    返回(requests会话, 浏览器holder或None)；holder不为None时任务结束后必须close()"""
     saved_phone, saved = load_saved_cookies()
     if saved and saved_phone == phone.strip():
         if cookies_statically_expired(saved):
             log_print("⚠️本地cookie的时间戳已过期，发起服务端探测确认是否真的失效")
         session = build_session_from_cookies(saved)
         if probe_login_status(session):
-            return session
+            return session, None
         log_print("本地cookie已失效，重新登录并更新本地文件")
     else:
         if saved:
@@ -255,81 +286,158 @@ def get_valid_session(chrome_exe_path: str, phone: str, password: str):
     return login_and_get_session(chrome_exe_path, phone, password)
 
 
-def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
-    """启动浏览器登录，返回带cookie的requests.Session，并把cookie保存到本地"""
-    browser = None
-    context = None
-    try:
-        with sync_playwright() as p:
-            launch_opt = {"headless": False}
-            if chrome_exe_path and os.path.exists(chrome_exe_path):
-                launch_opt["executable_path"] = chrome_exe_path
+class BrowserHolder:
+    """保持Playwright浏览器在爬取期间存活，用于接口被WAF拦截时回退到浏览器通道；用完必须close()"""
+
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+
+    def close(self):
+        for obj in (self.context, self.browser):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+        if self.playwright is not None:
+            try:
+                self.playwright.stop()
+            except Exception:
+                pass
+
+
+class ApiClient:
+    """接口请求封装：优先requests；返回被拦截(非JSON/异常HTML)时自动切换Playwright浏览器通道"""
+
+    def __init__(self, session: requests.Session = None, pw_context=None):
+        self.session = session
+        self.pw_context = pw_context
+        self.use_pw = False  # True=后续全部走浏览器通道
+
+    @staticmethod
+    def _looks_blocked(ct: str, body: str) -> bool:
+        ct = (ct or "").lower()
+        if "json" in ct or (body or "").lstrip().startswith("{"):
+            return False
+        # HTML只有阅读器的正常HTML(含slider-img)不算被拦
+        return "slider-img" not in (body or "")
+
+    def get_text(self, url, headers=None, timeout=30, retries=2) -> str:
+        for attempt in range(retries + 1):
+            check_stop()
+            if not self.use_pw and self.session is not None:
+                try:
+                    resp = self.session.get(url, headers=headers, timeout=timeout)
+                    body = resp.text
+                    if not self._looks_blocked(resp.headers.get("content-type"), body):
+                        return body
+                    log_print(f"⚠️requests返回异常内容 status={resp.status_code}，疑似被WAF拦截，切换浏览器通道")
+                    log_print(f"   响应片段: {(body or '')[:200]}")
+                    self.use_pw = True
+                except Exception as e:
+                    log_print(f"⚠️requests请求异常:{e}，切换浏览器通道")
+                    self.use_pw = True
+            if self.pw_context is not None:
+                try:
+                    resp = self.pw_context.request.get(url, headers=headers or {}, timeout=timeout)
+                    body = resp.text()
+                    if resp.ok and not self._looks_blocked(resp.headers.get("content-type"), body):
+                        return body
+                    log_print(f"⚠️浏览器通道响应异常 status={resp.status}，第{attempt + 1}/{retries}次重试")
+                    log_print(f"   响应片段: {(body or '')[:200]}")
+                except Exception as e:
+                    log_print(f"⚠️浏览器通道请求异常:{e}，第{attempt + 1}/{retries}次重试")
             else:
-                launch_opt["channel"] = "chrome"
-            browser = p.chromium.launch(**launch_opt)
-            context = browser.new_context(
-                viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
-            )
-            page = context.new_page()
-            safe_goto(page, BrowserConfig.HOME_URL)
+                log_print(f"⚠️无浏览器通道可用，第{attempt + 1}/{retries}次放弃重试")
             safe_sleep(2)
+        return ""
+
+    def get_bytes(self, url, timeout=30):
+        """下载二进制内容，返回bytes或None；requests失败自动走浏览器通道"""
+        if not self.use_pw and self.session is not None:
+            try:
+                resp = self.session.get(url, timeout=timeout)
+                resp.raise_for_status()
+                return resp.content
+            except Exception:
+                self.use_pw = True
+        if self.pw_context is not None:
+            try:
+                resp = self.pw_context.request.get(url, timeout=timeout)
+                if resp.ok:
+                    return resp.body()
+            except Exception as e:
+                log_print(f"⚠️浏览器通道下载异常:{e}")
+        return None
+
+
+def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
+    """启动浏览器登录，返回(requests会话, 浏览器holder)；holder需在任务结束后close()"""
+    holder = BrowserHolder()
+    try:
+        holder.playwright = sync_playwright().start()
+        launch_opt = {"headless": False}
+        if chrome_exe_path and os.path.exists(chrome_exe_path):
+            launch_opt["executable_path"] = chrome_exe_path
+        else:
+            launch_opt["channel"] = "chrome"
+        holder.browser = holder.playwright.chromium.launch(**launch_opt)
+        holder.context = holder.browser.new_context(
+            viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
+        )
+        page = holder.context.new_page()
+        safe_goto(page, BrowserConfig.HOME_URL)
+        safe_sleep(2)
+        if not wait_for_manual_captcha(page):
+            raise Exception("验证码等待失败")
+        if not is_logged_in(page):
+            if not ensure_on_login_page(page):
+                raise Exception("无法进入登录页面")
             if not wait_for_manual_captcha(page):
-                raise Exception("验证码等待失败")
-            if not is_logged_in(page):
-                if not ensure_on_login_page(page):
-                    raise Exception("无法进入登录页面")
-                if not wait_for_manual_captcha(page):
-                    raise Exception("登录页验证码失败")
-                page.wait_for_selector("#phone_number", timeout=12000)
-                log_print(f"输入账号:{phone}")
-                page.fill("#phone_number", phone)
-                safe_sleep(0.3)
-                page.fill("#phone_pwd", password)
-                safe_sleep(0.3)
-                page.dispatch_event("#phone_number", "input")
-                page.dispatch_event("#phone_pwd", "input")
-                safe_sleep(0.5)
-                login_submit = page.locator("input.phone_login_btn")
-                if login_submit.count() > 0:
-                    log_print("点击登录按钮")
-                    try:
-                        login_submit.click()
-                        safe_sleep(3)
-                    except Exception as e:
-                        log_print(f"点击登录异常:{e}")
-                login_ok = False
-                for _ in range(12):
-                    check_stop()
-                    if is_logged_in(page):
-                        log_print("✅登录成功")
-                        login_ok = True
-                        break
-                    if (
-                        page.locator(
-                            "#captcha_container, .vc_captcha_box_theme"
-                        ).count()
-                        > 0
-                    ):
-                        wait_for_manual_captcha(page, timeout=60)
+                raise Exception("登录页验证码失败")
+            page.wait_for_selector("#phone_number", timeout=12000)
+            log_print(f"输入账号:{phone}")
+            page.fill("#phone_number", phone)
+            safe_sleep(0.3)
+            page.fill("#phone_pwd", password)
+            safe_sleep(0.3)
+            page.dispatch_event("#phone_number", "input")
+            page.dispatch_event("#phone_pwd", "input")
+            safe_sleep(0.5)
+            login_submit = page.locator("input.phone_login_btn")
+            if login_submit.count() > 0:
+                log_print("点击登录按钮")
+                try:
+                    login_submit.click()
                     safe_sleep(3)
-                if not login_ok:
-                    log_print("⚠️未检测登录成功标记，继续使用当前cookie尝试")
-            safe_sleep(1)
-            cookies = context.cookies()
-            save_cookies_to_file(phone, cookies)
-            return build_session_from_cookies(cookies)
-    finally:
-        # 保证资源释放，防止残留chrome进程
-        if context is not None:
-            try:
-                context.close()
-            except Exception:
-                pass
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
+                except Exception as e:
+                    log_print(f"点击登录异常:{e}")
+            login_ok = False
+            for _ in range(12):
+                check_stop()
+                if is_logged_in(page):
+                    log_print("✅登录成功")
+                    login_ok = True
+                    break
+                if (
+                    page.locator(
+                        "#captcha_container, .vc_captcha_box_theme"
+                    ).count()
+                    > 0
+                ):
+                    wait_for_manual_captcha(page, timeout=60)
+                safe_sleep(3)
+            if not login_ok:
+                log_print("⚠️未检测登录成功标记，继续使用当前cookie尝试")
+        safe_sleep(1)
+        cookies = holder.context.cookies()
+        save_cookies_to_file(phone, cookies)
+        return build_session_from_cookies(cookies), holder
+    except Exception:
+        holder.close()
+        raise
 
 
 # ===================== 杂志爬取模块 =====================
@@ -359,19 +467,17 @@ def parse_reader_response(resp_text: str):
     return img_urls
 
 
-def download_image(url: str, save_path: str, session: requests.Session, max_retry=3, retry_interval=30):
-    """带重试下载图片，失败间隔30秒，最多重试3次"""
+def download_image(url: str, save_path: str, client: ApiClient, max_retry=3, retry_interval=30):
+    """带重试下载图片，失败间隔30秒，最多重试3次；requests失败自动走浏览器通道"""
     check_stop()
     for attempt in range(1, max_retry + 1):
         check_stop()
         try:
-            resp = session.get(url, timeout=30, stream=True)
-            resp.raise_for_status()
+            data = client.get_bytes(url)
+            if data is None:
+                raise Exception("下载返回空内容")
             with open(save_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    check_stop()
-                    if chunk:
-                        f.write(chunk)
+                f.write(data)
             log_print(f"已下载 {os.path.basename(save_path)}")
             return True
         except Exception as e:
@@ -416,7 +522,9 @@ def crawl_magazine_images(
     target_year: str,
     target_volume_name_text: str,
     save_root: str,
+    pw_context=None,
 ):
+    client = ApiClient(session, pw_context)
     ts = int(time.time() * 1000)
     search_url = (
         f"https://web.591adb.cn/search/hngymyzyxy.html?st=1&page_num=1"
@@ -431,10 +539,15 @@ def crawl_magazine_images(
         }
     )
     log_print(f"请求搜索接口 {search_url}")
-    r_search = session.get(search_url, headers=xml_headers, timeout=30)
-    search_json = r_search.json()
+    search_text = client.get_text(search_url, headers=xml_headers)
+    if not search_text:
+        raise Exception("搜索接口请求失败（requests与浏览器通道均失败）")
+    try:
+        search_json = json.loads(search_text)
+    except json.JSONDecodeError:
+        raise Exception(f"搜索接口返回非JSON内容: {search_text[:200]}")
     if search_json.get("code") != 1:
-        raise Exception("搜索接口返回失败")
+        raise Exception(f"搜索接口返回失败: {search_json}")
     data_section = search_json.get("data", {})
     html_str = data_section.get("html", "")
     parse_res = parse_search_html(html_str)
@@ -444,16 +557,26 @@ def crawl_magazine_images(
     log_print(f"resource_id={resource_id}")
     corver_ts = int(time.time() * 1000)
     cover_url = f"https://web.591adb.cn/magazine/thumblist/hngymyzyxy_{resource_id}.html?p=1&_={corver_ts}"
-    r_cover = session.get(cover_url, headers=xml_headers, timeout=30)
-    cover_json = r_cover.json()
+    cover_text = client.get_text(cover_url, headers=xml_headers)
+    if not cover_text:
+        raise Exception("获取封面列表请求失败")
+    try:
+        cover_json = json.loads(cover_text)
+    except json.JSONDecodeError:
+        raise Exception(f"封面列表接口返回非JSON内容: {cover_text[:200]}")
     if cover_json.get("error") != 0:
         raise Exception("获取封面列表失败")
     item_info = cover_json.get("data", {}).get("item_info", {})
     magazine_id = item_info.get("magazine_id")
     past_ts = int(time.time() * 1000)
     past_url = f"https://web.591adb.cn/magazine/past/hngymyzyxy_{magazine_id}.html?_={past_ts}"
-    r_past = session.get(past_url, headers=xml_headers, timeout=30)
-    past_json = r_past.json()
+    past_text = client.get_text(past_url, headers=xml_headers)
+    if not past_text:
+        raise Exception("获取刊期列表请求失败")
+    try:
+        past_json = json.loads(past_text)
+    except json.JSONDecodeError:
+        raise Exception(f"刊期列表接口返回非JSON内容: {past_text[:200]}")
     if past_json.get("error") != 0:
         raise Exception("获取刊期列表失败")
 
@@ -505,14 +628,14 @@ def crawl_magazine_images(
             reader_ts = int(time.time() * 1000)
             if p == 1:
                 reader_url = f"https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html?&p={p}&_={reader_ts}"
-                r_reader = session.get(reader_url, timeout=30)
+                reader_text = client.get_text(reader_url)
             else:
                 reader_url = (
                     f"https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html?"
                     f"item_id={item_id}&uf=0&p={p}&_={reader_ts}"
                 )
-                r_reader = session.get(reader_url, headers=xml_headers, timeout=30)
-            img_list = parse_reader_response(r_reader.text)
+                reader_text = client.get_text(reader_url, headers=xml_headers)
+            img_list = parse_reader_response(reader_text)
             break_flag = False
             # =====修复广告判断逻辑，还原原版逻辑=====
             for i in range(len(img_list) - 1, -1, -1):
@@ -537,7 +660,7 @@ def crawl_magazine_images(
             check_stop()
             ext = img_url.split(".")[-1]
             save_file = os.path.join(save_dir, f"{idx+1:03d}.{ext}")
-            ok = download_image(img_url, save_file, session)
+            ok = download_image(img_url, save_file, client)
             if ok:
                 local_paths.append(save_file)
         # 每下载完1期图片，立即把该期结果yield出去，由上层马上转PDF
@@ -675,11 +798,13 @@ def background_task(
     pdf_owner_pwd,
     save_result_dir,
 ):
+    holder = None
     try:
         TASK_STOP_EVENT.clear()
         save_account(phone, password)
+        log_print(f"🚀开始执行任务，数据目录:{DATA_DIR}")
         log_print("🚀开始执行任务，准备登录会话")
-        session = get_valid_session(chrome_path, phone, password)
+        session, holder = get_valid_session(chrome_path, phone, password)
         log_print("✅获取Cookie完成，开始爬取杂志图片")
 
         # 处理水印文件与页码（提前校验，避免下完图片才发现参数错误）
@@ -698,6 +823,7 @@ def background_task(
         item_count = 0
         for item in crawl_magazine_images(
             session=session,
+            pw_context=holder.context if holder is not None else None,
             keyword=book_name,
             target_year=year_str,
             target_volume_name_text=issue_str,
@@ -743,6 +869,10 @@ def background_task(
         import traceback
         log_print(f"\n❌任务异常 {e}")
         log_print(traceback.format_exc())
+    finally:
+        # 任务结束后释放浏览器（登录通道的浏览器在爬取期间保持打开，供WAF回退使用）
+        if holder is not None:
+            holder.close()
 
 
 # ===================== GUI主界面 =====================
