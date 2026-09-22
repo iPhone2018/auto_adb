@@ -49,6 +49,8 @@ COOKIE_STORE = os.path.join(DATA_DIR, "mag_cookies.json")
 LOG_FILE = os.path.join(DATA_DIR, "mag_run.log")
 TASK_STOP_EVENT = threading.Event()
 LOG_QUEUE = Queue()  # 无maxsize，put_nowait不会阻塞后台线程
+API_CALL_INTERVAL = 0.3  # 每次接口调用后的统一间隔(秒)，控制请求频率
+DOWNLOAD_INTERVAL = 0.5  # 每张图片下载后的统一间隔(秒)，控制请求频率
 
 
 def log_print(text: str):
@@ -147,11 +149,16 @@ def is_logged_in(page) -> bool:
         return False
 
 
+WAF_CAPTCHA_SELECTOR = (
+    "#vc_captcha_box, .vc_captcha_box_theme, #captcha_container, .captcha_verify_bar--title"
+)
+# 火山引擎WAF安全检测页特征：页面返回HTTP 200且不含登录表单，只能靠内容识别
+WAF_TEXT_MARKERS = ("安全检测", "TTGCaptcha", "waf-captcha-proxy")
+
+
 def wait_for_manual_captcha(page, timeout: int = 120) -> bool:
     try:
-        captcha = page.locator(
-            "#captcha_container, .vc_captcha_box_theme, #vc_captcha_box, .captcha_verify_bar--title"
-        )
+        captcha = page.locator(WAF_CAPTCHA_SELECTOR)
         if captcha.count() == 0:
             log_print("未检测到滑动验证码")
             return True
@@ -171,27 +178,113 @@ def wait_for_manual_captcha(page, timeout: int = 120) -> bool:
         return True
 
 
-def ensure_on_login_page(page):
-    log_print("进入登录页面")
-    if safe_goto(page, BrowserConfig.LOGIN_URL):
-        safe_sleep(2)
-        if page.locator("#phone_number").count() > 0:
-            log_print("成功进入登录页")
+def is_waf_challenge(page) -> bool:
+    """当前页面是否为站点前置的WAF安全检测页；
+    读不到页面（正在跳转/被abort）时按“尚未就绪”处理，让调用方继续等"""
+    try:
+        if page.locator(WAF_CAPTCHA_SELECTOR).count() > 0:
             return True
-    safe_goto(page, BrowserConfig.HOME_URL)
-    safe_sleep(2)
+        html = page.content()
+    except Exception:
+        return True
+    return any(m in html for m in WAF_TEXT_MARKERS)
+
+
+def has_login_form(page) -> bool:
+    """登录表单是否已出现（判断真实页面已就绪，而不是WAF检测页）"""
+    try:
+        return page.locator("#phone_number").count() > 0
+    except Exception:
+        return False
+
+
+def is_page_ready(page) -> bool:
+    """页面是否已真正加载出内容。
+    注意：WAF检测页通过后 successCb 会 location.reload()，reload 过渡期 DOM 为空，
+    此时 page.content() 里既没有WAF特征、也没有正文，绝不能判成“检测已通过”，
+    否则会在页面还没出来时就再次跳转，把加载中的页面打断，陷入空转"""
+    try:
+        if page.locator(WAF_CAPTCHA_SELECTOR).count() > 0:
+            return False
+        return bool(
+            page.evaluate(
+                "() => !!(document.body && document.body.innerText "
+                "&& document.body.innerText.trim().length > 20)"
+            )
+        )
+    except Exception:
+        return False
+
+
+def wait_page_ready(page, timeout: int = 180) -> bool:
+    """等待页面真正就绪：WAF安全检测页、以及检测通过后的reload过渡期都算“未就绪”。
+    检测到滑块时提示用户在浏览器窗口手动完成，程序只负责等待，不做任何自动绕过。
+    就绪返回True；超时返回False（调用方自行决定后续）"""
+    deadline = time.time() + timeout
+    notified = False
+    while time.time() < deadline:
+        check_stop()
+        if is_page_ready(page):
+            if notified:
+                log_print("✅站点安全检测已通过，页面已加载完成")
+            return True
+        if not notified and is_waf_challenge(page):
+            log_print("⚠️站点安全检测（火山引擎WAF）拦截：请在已打开的浏览器窗口手动完成滑块验证，程序会自动等待")
+            notified = True
+        safe_sleep(1)
+    log_print(f"⚠️等待页面加载就绪超时（{timeout}秒）")
+    return False
+
+
+def goto_quiet(page, url) -> bool:
+    """跳转并吞掉异常：WAF检测页 successCb 里的 location.reload() 会和我们的goto抢导航，
+    产生 ERR_ABORTED，属正常竞态，不该中断流程"""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        return True
+    except Exception as e:
+        log_print(f"⚠️跳转 {url} 异常:{e}")
+        return False
+
+
+def click_login_button(page):
     login_btn = page.locator("a.top-login-btn")
     if login_btn.count() > 0:
         try:
             login_btn.first.click()
-            safe_sleep(3)
+            safe_sleep(2)
         except Exception as e:
             log_print(f"点击登录按钮异常:{e}")
-    if page.locator("#phone_number").count() > 0:
-        return True
-    safe_goto(page, BrowserConfig.LOGIN_URL)
-    safe_sleep(2)
-    return page.locator("#phone_number").count() > 0
+
+
+def ensure_on_login_page(page, timeout: int = 240) -> bool:
+    """进入登录页：站点前置了WAF安全检测，且检测通过后页面还会reload，
+    所以每次跳转后都要先等页面真正就绪，再看登录表单在不在"""
+    log_print("进入登录页面")
+    deadline = time.time() + timeout
+    attempt = 0
+    while time.time() < deadline:
+        check_stop()
+        if has_login_form(page):
+            log_print("成功进入登录页")
+            return True
+        attempt += 1
+        if attempt > 1:
+            log_print(f"第{attempt}次尝试进入登录页")
+        # 奇数轮直接开登录页，偶数轮回首页点登录按钮（保留原有两条路径）
+        if attempt % 2 == 1:
+            goto_quiet(page, BrowserConfig.LOGIN_URL)
+        else:
+            goto_quiet(page, BrowserConfig.HOME_URL)
+            click_login_button(page)
+        wait_page_ready(page, timeout=90)
+        if not has_login_form(page):
+            try:
+                log_print(f"   当前页面: {page.url} | 标题: {page.title()[:40]}")
+            except Exception:
+                pass
+    log_print("❌等待进入登录页超时，始终未出现登录表单 #phone_number")
+    return False
 
 
 def load_saved_cookies():
@@ -249,30 +342,16 @@ def cookies_statically_expired(cookies: list) -> bool:
     return False
 
 
-def probe_login_status(session: requests.Session) -> bool:
-    """动态探测：用cookie请求首页，检查HTML是否含已登录标记（服务端会话的真实状态）"""
-    try:
-        resp = session.get(BrowserConfig.HOME_URL, timeout=20)
-        html = resp.text
-        if "edit-password" in html or "logout" in html:
-            log_print("✅本地cookie有效（服务端确认已登录），无需打开浏览器")
-            return True
-        if "phone_number" in html:
-            log_print(f"⚠️首页显示未登录(status={resp.status_code})，本地cookie已失效，需要重新登录")
-        else:
-            log_print(f"⚠️首页响应异常(status={resp.status_code}, 长度={len(html)})，疑似被WAF拦截，按失效处理重新登录")
-        return False
-    except Exception as e:
-        log_print(f"⚠️登录状态探测失败: {e}，将重新登录")
-        return False
-
-
-def build_headless_context_from_cookies(chrome_exe_path: str, cookies: list) -> "BrowserHolder":
-    """启动无头浏览器并注入本地cookie，返回holder；失败会抛异常"""
+def build_context_from_cookies(
+    chrome_exe_path: str, cookies: list, headless: bool = False
+) -> "BrowserHolder":
+    """启动浏览器并注入cookie，返回holder；失败会抛异常。
+    默认可见模式：站点前置了火山引擎WAF，实测无头浏览器过不了安全检测
+    （检测页不会自动放行），只有可见浏览器能过一次检测后正常访问"""
     holder = BrowserHolder()
     try:
         holder.playwright = sync_playwright().start()
-        launch_opt = {"headless": True}
+        launch_opt = {"headless": headless}
         resolved = resolve_chrome_path(chrome_exe_path)
         if resolved:
             launch_opt["executable_path"] = resolved
@@ -282,94 +361,114 @@ def build_headless_context_from_cookies(chrome_exe_path: str, cookies: list) -> 
         holder.context = holder.browser.new_context(
             viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
         )
-        pw_cookies = []
-        for ck in cookies:
-            item = {
-                "name": ck["name"],
-                "value": ck["value"],
-                "domain": (ck.get("domain") or "").lstrip("."),
-                "path": ck.get("path") or "/",
-            }
-            exp = ck.get("expires")
-            try:
-                exp = float(exp)
-                if exp > 0:
-                    item["expires"] = int(exp)
-            except (TypeError, ValueError):
-                pass
-            pw_cookies.append(item)
-        holder.context.add_cookies(pw_cookies)
+        if cookies:
+            pw_cookies = []
+            for ck in cookies:
+                item = {
+                    "name": ck["name"],
+                    "value": ck["value"],
+                    "domain": (ck.get("domain") or "").lstrip("."),
+                    "path": ck.get("path") or "/",
+                }
+                exp = ck.get("expires")
+                try:
+                    exp = float(exp)
+                    if exp > 0:
+                        item["expires"] = int(exp)
+                except (TypeError, ValueError):
+                    pass
+                pw_cookies.append(item)
+            holder.context.add_cookies(pw_cookies)
         return holder
     except Exception:
         holder.close()
         raise
 
 
-def probe_login_status_pw(context) -> bool:
-    """浏览器通道探测：用context.request请求首页检查登录标记（绕过WAF对requests的拦截）"""
+def probe_api_available(holder, keyword: str = "") -> bool:
+    """用浏览器通道请求搜索接口，能拿到正常JSON(code=1)才算通道可用。
+    站点改版后 a.edit-password/a.logout 等登录态标记已消失，登录页还会把已认证的会话重定向回首页，
+    所以不能再靠“登录标记”判断，只能看接口是否真的可用。
+    ⚠️必须先让浏览器打开首页跑一次JS过掉WAF安全检测，否则接口拿回的是检测页"""
+    page = None
     try:
-        resp = context.request.get(BrowserConfig.HOME_URL, timeout=20 * 1000)
-        html = resp.text()
-        if "edit-password" in html or "logout" in html:
+        page = holder.context.new_page()
+        goto_quiet(page, BrowserConfig.HOME_URL)
+        if not wait_page_ready(page, timeout=90):
+            log_print("⚠️浏览器通道：站点安全检测未通过，无法探测接口")
+            return False
+        ts = int(time.time() * 1000)
+        url = (
+            f"https://web.591adb.cn/search/hngymyzyxy.html?st=1&page_num=1"
+            f"&keywords={requests.utils.quote(keyword or '期刊')}&withCount=1&ts={ts}"
+        )
+        headers = dict(BrowserConfig.REQ_HEADERS)
+        headers.update(
+            {"x-requested-with": "XMLHttpRequest", "sec-fetch-mode": "cors", "priority": "u=1,i"}
+        )
+        resp = holder.context.request.get(url, headers=headers, timeout=30000)
+        text = resp.text()
+        data = json.loads(text)
+        if data.get("code") == 1:
             return True
-        if "phone_number" in html:
-            log_print(f"⚠️浏览器通道确认：首页显示未登录(status={resp.status})，本地cookie已失效")
-        else:
-            log_print(f"⚠️浏览器通道响应异常 status={resp.status}，按cookie失效处理")
+        log_print(f"⚠️搜索接口返回异常: {str(data)[:200]}")
         return False
     except Exception as e:
-        log_print(f"⚠️浏览器通道探测异常: {e}")
+        log_print(f"⚠️浏览器通道接口探测失败: {e}")
         return False
-
-
-def get_valid_session(chrome_exe_path: str, phone: str, password: str):
-    """获取(requests会话, 浏览器holder或None, prefer_pw是否跳过requests)：
-    - Windows：requests被WAF拦截，探测和爬取全部走浏览器通道（cookie有效时用无头浏览器，无需验证码）
-    - macOS等：requests优先，被拦截才回退浏览器通道"""
-    saved_phone, saved = load_saved_cookies()
-    if saved and saved_phone == phone.strip():
-        if cookies_statically_expired(saved):
-            log_print("⚠️本地cookie的时间戳已过期，发起探测确认是否真的失效")
-        if sys.platform == "win32":
-            holder = None
+    finally:
+        if page is not None:
             try:
-                holder = build_headless_context_from_cookies(chrome_exe_path, saved)
-                if probe_login_status_pw(holder.context):
-                    log_print("✅本地cookie有效（浏览器通道确认），使用无头浏览器通道爬取")
-                    return build_session_from_cookies(saved), holder, True
-                log_print("本地cookie已失效，重新登录并更新本地文件")
-                holder.close()
-                holder = None
-            except Exception as e:
-                log_print(f"⚠️无头浏览器启动失败: {e}，重新登录")
-                if holder is not None:
-                    holder.close()
-        else:
-            session = build_session_from_cookies(saved)
-            if probe_login_status(session):
-                return session, None, False
-            log_print("本地cookie已失效，重新登录并更新本地文件")
-    else:
-        if saved:
-            log_print("⚠️本地cookie属于其他账号，需要重新登录")
-        else:
-            log_print("本地无保存的cookie，需要登录")
+                page.close()
+            except Exception:
+                pass
+
+
+def get_valid_session(chrome_exe_path: str, phone: str, password: str, keyword: str = ""):
+    """获取(requests会话, 浏览器holder, prefer_pw恒为True)。
+    站点已加火山引擎WAF安全检测，实测结论：
+      - requests 被拦，返回检测页而非接口数据
+      - 无头浏览器同样过不了检测，检测页不会自动放行
+      - 只有可见浏览器能过一次检测，之后所有请求沿用该浏览器通道(context.request)
+    且站点对本站访问者直接放行，本地会话只要接口可用就不需要登录，因此不再强制走登录流程"""
+    saved_phone, saved = load_saved_cookies()
+    use_saved = bool(saved) and saved_phone == phone.strip()
+    if saved and not use_saved:
+        log_print("⚠️本地cookie属于其他账号，先用匿名会话探测")
+    elif not saved:
+        log_print("本地无保存的cookie，直接用浏览器通道访问")
+    elif cookies_statically_expired(saved):
+        log_print("⚠️本地cookie的时间戳已过期，用浏览器通道探测确认是否真的失效")
+
+    holder = None
+    probe_cookies = saved if use_saved else []
+    try:
+        holder = build_context_from_cookies(chrome_exe_path, probe_cookies)
+        if probe_api_available(holder, keyword):
+            log_print("✅浏览器通道验证通过，站点可直接访问（无需登录），开始爬取")
+            return build_session_from_cookies(probe_cookies), holder, True
+        log_print("⚠️浏览器通道接口探测未通过，改为登录")
+        holder.close()
+        holder = None
+    except Exception as e:
+        log_print(f"⚠️浏览器通道建立失败: {e}，改为登录")
+        if holder is not None:
+            holder.close()
+            holder = None
+
+    # 兜底：真的需要登录时才走这里
     session, holder = login_and_get_session(chrome_exe_path, phone, password)
-    # 登录完成、cookie已保存，立即关闭可见浏览器
     if holder is not None:
         holder.close()
         holder = None
         log_print("✅登录完成，浏览器窗口已关闭")
-    if sys.platform == "win32":
-        # Windows：requests被WAF拦截，用刚保存的cookie启动无头浏览器作为爬取通道
-        _, fresh = load_saved_cookies()
-        if fresh:
-            try:
-                holder = build_headless_context_from_cookies(chrome_exe_path, fresh)
-                log_print("✅已启动无头浏览器通道，开始爬取")
-            except Exception as e:
-                log_print(f"⚠️无头浏览器启动失败: {e}，本次爬取将无浏览器通道可用")
-    return session, holder, sys.platform == "win32"
+    _, fresh = load_saved_cookies()
+    try:
+        holder = build_context_from_cookies(chrome_exe_path, fresh)
+        log_print("✅已启动浏览器通道，开始爬取")
+    except Exception as e:
+        log_print(f"⚠️登录后浏览器通道启动失败: {e}")
+    return build_session_from_cookies(fresh), holder, True
 
 
 class BrowserHolder:
@@ -413,6 +512,12 @@ class ApiClient:
         return "slider-img" not in (body or "")
 
     def get_text(self, url, headers=None, timeout=30, retries=2) -> str:
+        """对外统一入口：每次接口调用后固定间隔 API_CALL_INTERVAL，控制请求频率"""
+        body = self._request_text(url, headers, timeout, retries)
+        safe_sleep(API_CALL_INTERVAL)
+        return body
+
+    def _request_text(self, url, headers=None, timeout=30, retries=2) -> str:
         for attempt in range(retries + 1):
             check_stop()
             if not self.use_pw and self.session is not None:
@@ -506,8 +611,10 @@ def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
             viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
         )
         page = holder.context.new_page()
-        safe_goto(page, BrowserConfig.HOME_URL)
-        safe_sleep(2)
+        goto_quiet(page, BrowserConfig.HOME_URL)
+        # 站点前置了WAF安全检测：先等页面（检测页 + 检测通过后的reload过渡期）真正就绪，
+        # 再判断登录态，否则会把检测页/空白页误判成“未登录”
+        wait_page_ready(page)
         if not wait_for_manual_captcha(page):
             raise Exception("验证码等待失败")
         if not is_logged_in(page):
@@ -586,7 +693,8 @@ def parse_reader_response(resp_text: str):
 
 
 def download_image(url: str, save_path: str, client: ApiClient, max_retry=3, retry_interval=30):
-    """带重试下载图片，失败间隔30秒，最多重试3次；requests失败自动走浏览器通道"""
+    """带重试下载图片，失败间隔30秒，最多重试3次；requests失败自动走浏览器通道。
+    每次下载后固定间隔 DOWNLOAD_INTERVAL，控制请求频率"""
     check_stop()
     for attempt in range(1, max_retry + 1):
         check_stop()
@@ -597,6 +705,7 @@ def download_image(url: str, save_path: str, client: ApiClient, max_retry=3, ret
             with open(save_path, "wb") as f:
                 f.write(data)
             log_print(f"已下载 {os.path.basename(save_path)}")
+            safe_sleep(DOWNLOAD_INTERVAL)
             return True
         except Exception as e:
             log_print(f"下载失败[{attempt}/{max_retry}] {url}: {e}")
@@ -795,7 +904,9 @@ def crawl_magazine_images(
 # ===================== PDF水印与加密模块 =====================
 def image_to_pdf_bytes(image_path: str) -> BytesIO:
     check_stop()
-    img = Image.open(image_path).convert("RGB")
+    # 用with确保图片文件句柄立即释放：Windows下未释放的句柄会让后续删除该图片失败(PermissionError)
+    with Image.open(image_path) as im:
+        img = im.convert("RGB")
     buf = BytesIO()
     img.save(buf, format="PDF")
     buf.seek(0)
@@ -836,6 +947,27 @@ def parse_watermark_pages(text: str) -> list:
 def sanitize_filename_part(name: str) -> str:
     """去除文件名/目录名中的非法字符，防止写入失败"""
     return re.sub(r'[\\/:*?"<>|\r\n\t]', "_", name).strip()
+
+
+def cleanup_downloaded_images(image_paths: list, img_dir: str):
+    """删除已生成PDF的下载图片；该期目录若已空则一并删除（PDF生成失败时不调用，保证图片保留可重试）"""
+    failed = 0
+    for p in image_paths:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception as e:
+            failed += 1
+            log_print(f"⚠️删除失败 {p}: {e}")
+    try:
+        if img_dir and os.path.isdir(img_dir) and not os.listdir(img_dir):
+            os.rmdir(img_dir)
+    except Exception as e:
+        log_print(f"⚠️删除空目录失败 {img_dir}: {e}")
+    if failed:
+        log_print(f"⚠️本期有{failed}个下载文件未能删除，请手动清理: {img_dir}")
+    else:
+        log_print(f"🗑️已删除本期下载文件: {img_dir}")
 
 
 def build_pdf(
@@ -922,6 +1054,7 @@ def background_task(
     watermark_pages_text,
     pdf_owner_pwd,
     save_result_dir,
+    del_after_pdf=False,
 ):
     holder = None
     try:
@@ -929,7 +1062,7 @@ def background_task(
         save_account(phone, password)
         log_print(f"🚀开始执行任务，数据目录:{DATA_DIR}")
         log_print("🚀开始执行任务，准备登录会话")
-        session, holder, prefer_pw = get_valid_session(chrome_path, phone, password)
+        session, holder, prefer_pw = get_valid_session(chrome_path, phone, password, book_name)
         log_print("✅获取Cookie完成，开始爬取杂志图片")
 
         # 处理水印文件与页码（提前校验，避免下完图片才发现参数错误）
@@ -943,6 +1076,8 @@ def background_task(
                 log_print(f"水印插入页码:{wm_page_list}")
         if not watermark_file:
             log_print("未选择水印文件，将生成无水印PDF")
+        if del_after_pdf:
+            log_print("已勾选「生成pdf后删除下载文件」：每期PDF生成成功后删除该期下载的图片")
 
         # 每下载完1期图片，立即生成该期PDF
         item_count = 0
@@ -975,6 +1110,8 @@ def background_task(
                     owner_password=pdf_owner_pwd,
                 )
                 log_print(f"📄刊期 {vol_name} PDF已生成，继续下一期")
+                if del_after_pdf:
+                    cleanup_downloaded_images(img_paths, item.get("dir", ""))
             except Exception as e:
                 log_print(f"❌生成PDF失败 {vol_name}: {e}")
                 import traceback
@@ -1085,6 +1222,12 @@ class App:
         ent_chrome.grid(row=1, column=4, sticky=tk.EW, padx=(0, 6), pady=4)
         btn_chrome.grid(row=1, column=5, pady=4)
 
+        self.del_after_pdf_var = tk.BooleanVar(value=False)
+        chk_del_after_pdf = ttk.Checkbutton(
+            pdf_box, text="生成pdf后删除下载文件", variable=self.del_after_pdf_var
+        )
+        chk_del_after_pdf.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=(6, 2))
+
         # ===== 操作按钮 =====
         btn_frame = ttk.Frame(root, padding=(16, 10))
         btn_frame.pack(fill=tk.X)
@@ -1133,6 +1276,7 @@ class App:
         self.watermark_file_var.set(cfg.get("watermark_file", ""))
         self.watermark_page_var.set(cfg.get("watermark_pages", ""))
         self.pdf_pwd_var.set(cfg.get("pdf_pwd", ""))
+        self.del_after_pdf_var.set(bool(cfg.get("del_after_pdf", False)))
 
     def save_current_ui_config(self):
         cfg = {
@@ -1144,6 +1288,7 @@ class App:
             "watermark_file": self.watermark_file_var.get(),
             "watermark_pages": self.watermark_page_var.get(),
             "pdf_pwd": self.pdf_pwd_var.get(),
+            "del_after_pdf": self.del_after_pdf_var.get(),
         }
         save_last_config(cfg)
 
@@ -1225,6 +1370,7 @@ class App:
         save_dir = self.save_dir_var.get().strip()
         wm_file = self.watermark_file_var.get().strip()
         wm_pages = self.watermark_page_var.get().strip()
+        del_after_pdf = self.del_after_pdf_var.get()
 
         if not phone:
             messagebox.showerror("校验错误", "账号(手机号)不能为空")
@@ -1270,6 +1416,7 @@ class App:
                 wm_pages,
                 self.pdf_pwd_var.get().strip(),
                 save_dir,
+                del_after_pdf,
             )
             self._worker_done_callback()
 
