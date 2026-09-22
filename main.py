@@ -342,6 +342,22 @@ def cookies_statically_expired(cookies: list) -> bool:
     return False
 
 
+def has_login_cookie(cookies: list) -> bool:
+    """本地cookie里是否存在登录cookie；没有就说明是匿名会话，必须走登录"""
+    return any(c.get("name") == BrowserConfig.LOGIN_COOKIE_NAME for c in cookies)
+
+
+NO_LOGIN_MARKERS = ("请登录后再做操作", '"no_login"')
+
+
+def is_no_login_response(text: str) -> bool:
+    """站点改版后：reader等正文接口未登录时返回
+    {"code":0,"msg":"请登录后再做操作","data":{"no_login":1}}，HTTP状态仍是200"""
+    if not text:
+        return False
+    return any(m in text for m in NO_LOGIN_MARKERS)
+
+
 def build_context_from_cookies(
     chrome_exe_path: str, cookies: list, headless: bool = False
 ) -> "BrowserHolder":
@@ -430,39 +446,45 @@ def get_valid_session(chrome_exe_path: str, phone: str, password: str, keyword: 
       - requests 被拦，返回检测页而非接口数据
       - 无头浏览器同样过不了检测，检测页不会自动放行
       - 只有可见浏览器能过一次检测，之后所有请求沿用该浏览器通道(context.request)
-    且站点对本站访问者直接放行，本地会话只要接口可用就不需要登录，因此不再强制走登录流程"""
+    站点改版后正文(reader)接口已强制登录：匿名请求返回 {"code":0,"data":{"no_login":1}}，
+    而搜索接口匿名仍可用，所以不能再靠“搜索接口通”判断会话可用，必须确认有登录cookie"""
     saved_phone, saved = load_saved_cookies()
     use_saved = bool(saved) and saved_phone == phone.strip()
     if saved and not use_saved:
-        log_print("⚠️本地cookie属于其他账号，先用匿名会话探测")
+        log_print("⚠️本地cookie属于其他账号，忽略本地cookie")
+        saved = []
+        use_saved = False
     elif not saved:
-        log_print("本地无保存的cookie，直接用浏览器通道访问")
+        log_print("本地无保存的cookie，需要登录")
     elif cookies_statically_expired(saved):
-        log_print("⚠️本地cookie的时间戳已过期，用浏览器通道探测确认是否真的失效")
+        log_print("⚠️本地cookie的时间戳已过期，需要重新登录")
 
+    # 只有本地存在有效登录cookie时，才允许跳过登录
+    can_reuse = use_saved and has_login_cookie(saved) and not cookies_statically_expired(saved)
     holder = None
-    probe_cookies = saved if use_saved else []
-    try:
-        holder = build_context_from_cookies(chrome_exe_path, probe_cookies)
-        if probe_api_available(holder, keyword):
-            log_print("✅浏览器通道验证通过，站点可直接访问（无需登录），开始爬取")
-            return build_session_from_cookies(probe_cookies), holder, True
-        log_print("⚠️浏览器通道接口探测未通过，改为登录")
-        holder.close()
-        holder = None
-    except Exception as e:
-        log_print(f"⚠️浏览器通道建立失败: {e}，改为登录")
+    if can_reuse:
+        try:
+            holder = build_context_from_cookies(chrome_exe_path, saved)
+            if probe_api_available(holder, keyword):
+                log_print("✅本地登录cookie有效，浏览器通道验证通过，开始爬取")
+                return build_session_from_cookies(saved), holder, True
+            log_print("⚠️本地登录cookie已失效，改为重新登录")
+        except Exception as e:
+            log_print(f"⚠️浏览器通道建立失败: {e}，改为登录")
         if holder is not None:
             holder.close()
             holder = None
+    else:
+        log_print("🚀正文接口需要登录态，开始登录")
 
-    # 兜底：真的需要登录时才走这里
+    # 登录后直接沿用这个已登录、且已过WAF的浏览器通道：
+    # 重开浏览器会再次触发WAF安全检测，白白让用户多滑一次滑块
     session, holder = login_and_get_session(chrome_exe_path, phone, password)
     if holder is not None:
-        holder.close()
-        holder = None
-        log_print("✅登录完成，浏览器窗口已关闭")
+        log_print("✅已登录，沿用当前浏览器通道开始爬取")
+        return session, holder, True
     _, fresh = load_saved_cookies()
+    log_print("⚠️登录浏览器通道不可用，改用保存的cookie新建通道")
     try:
         holder = build_context_from_cookies(chrome_exe_path, fresh)
         log_print("✅已启动浏览器通道，开始爬取")
@@ -879,6 +901,14 @@ def crawl_magazine_images(
                     del img_list[i]
                     break_flag = True
             if not img_list:
+                # 未登录/被WAF拦截时接口同样返回200，但内容里没有图片列表。
+                # 必须显式报错，否则会静默变成“无可用图片”，白白跳过整期还不提示原因
+                if is_no_login_response(reader_text):
+                    raise Exception(
+                        "阅读器接口要求登录（返回「请登录后再做操作」），请确认保存的账号密码是否正确"
+                    )
+                if not reader_text:
+                    log_print(f"⚠️p={p}阅读器接口无有效响应（可能被WAF拦截），响应为空")
                 log_print(f"p={p}无更多图片，结束分页")
                 break
             all_img.extend(img_list)
