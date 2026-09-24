@@ -139,14 +139,34 @@ def safe_goto(page, url, max_retries=3):
     return False
 
 
+LOGIN_MARKER_SELECTORS = (
+    "a.edit-password",
+    "a.logout",
+    "a.login-out",
+    "a[href*='logout']",
+)
+LOGIN_MARKER_TEXTS = ("退出登录", "退出", "注销")
+
+
 def is_logged_in(page) -> bool:
+    """页面上的登录态标记。
+    ⚠️站点反复改版，这些标记可能整体消失（改版后连登录按钮都没有了），
+    所以它只能当作「看起来已登录」的提示，绝不能靠它决定要不要登录：
+    真正的判断依据是接口返回（见 probe_api_available 与 reader 的 no_login 判断）"""
+    for sel in LOGIN_MARKER_SELECTORS:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
     try:
-        return (
-            page.locator("a.edit-password").count() > 0
-            or page.locator("a.logout").count() > 0
-        )
+        for t in LOGIN_MARKER_TEXTS:
+            loc = page.get_by_text(re.compile(f"^{t}$"))
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
     except Exception:
-        return False
+        pass
+    return False
 
 
 WAF_CAPTCHA_SELECTOR = (
@@ -198,6 +218,59 @@ def has_login_form(page) -> bool:
         return False
 
 
+LOGIN_ENTRY_SELECTORS = (
+    "a.top-login-btn",
+    "a.login-btn",
+    "a.login",
+    ".login-btn",
+    "a[href*='login']",
+)
+LOGIN_ENTRY_TEXTS = ("登录", "立即登录", "登录/注册", "用户登录")
+
+
+def has_login_entry(page) -> bool:
+    """当前页面是否还存在可用的登录入口（登录按钮/登录链接/登录表单）。
+    站点会突然整块移除登录入口：登录页重定向回首页、首页也没有登录按钮，
+    此时任何登录动作都是徒劳的，必须尽早识别出来，直接跳过登录继续爬。
+    这里不押具体选择器，找到一个可见的登录入口就算「有」"""
+    try:
+        if has_login_form(page):
+            return True
+    except Exception:
+        pass
+    for sel in LOGIN_ENTRY_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
+        except Exception:
+            continue
+    try:
+        for t in LOGIN_ENTRY_TEXTS:
+            loc = page.get_by_text(re.compile(f"^{t}$"))
+            if loc.count() > 0 and loc.first.is_visible():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def log_page_entries(page):
+    """站点再次改版时用来定位登录入口：把页面上可见的链接/按钮打到日志里，
+    下次改版看日志就能直接知道入口变成了什么，不用再猜"""
+    try:
+        items = page.eval_on_selector_all(
+            "a, button",
+            "els => els.filter(e => e.offsetParent !== null)"
+            ".map(e => ((e.innerText || '').trim().slice(0, 16) + ' -> ' "
+            "+ (e.getAttribute('href') || '')).slice(0, 80))"
+            ".slice(0, 40)",
+        )
+        log_print("   页面可见链接/按钮: " + " | ".join(items))
+    except Exception as e:
+        log_print(f"   页面入口信息读取失败: {e}")
+
+
 def is_page_ready(page) -> bool:
     """页面是否已真正加载出内容。
     注意：WAF检测页通过后 successCb 会 location.reload()，reload 过渡期 DOM 为空，
@@ -247,19 +320,28 @@ def goto_quiet(page, url) -> bool:
         return False
 
 
-def click_login_button(page):
-    login_btn = page.locator("a.top-login-btn")
-    if login_btn.count() > 0:
+def click_login_button(page) -> bool:
+    """点击首页的登录入口；站点改版可能换掉选择器，
+    所以先按原选择器点，点不到再按「登录」文字兜底找一次"""
+    candidates = [page.locator("a.top-login-btn")]
+    for t in LOGIN_ENTRY_TEXTS:
+        candidates.append(page.get_by_text(re.compile(f"^{t}$")))
+    for loc in candidates:
         try:
-            login_btn.first.click()
-            safe_sleep(2)
+            if loc.count() > 0 and loc.first.is_visible():
+                loc.first.click()
+                safe_sleep(2)
+                return True
         except Exception as e:
             log_print(f"点击登录按钮异常:{e}")
+    return False
 
 
 def ensure_on_login_page(page, timeout: int = 240) -> bool:
     """进入登录页：站点前置了WAF安全检测，且检测通过后页面还会reload，
-    所以每次跳转后都要先等页面真正就绪，再看登录表单在不在"""
+    所以每次跳转后都要先等页面真正就绪，再看登录表单在不在。
+    站点若已整块移除登录入口（登录页重定向回首页、首页也没有登录按钮），
+    这里会尽快判定并退出，不再空转重试（旧版会在240秒里疯狂跳转几十次）"""
     log_print("进入登录页面")
     deadline = time.time() + timeout
     attempt = 0
@@ -269,8 +351,18 @@ def ensure_on_login_page(page, timeout: int = 240) -> bool:
             log_print("成功进入登录页")
             return True
         attempt += 1
-        if attempt > 1:
-            log_print(f"第{attempt}次尝试进入登录页")
+        # 两条路径都试过、页面确实加载出来了、却找不到任何登录入口
+        # → 站点当前不提供登录，再跳多少次也没用，立即结束
+        if attempt > 2 and is_page_ready(page) and not has_login_entry(page):
+            # 登录入口可能是异步渲染出来的（SPA先出正文、后出按钮），
+            # 所以先等一会儿再确认一次，避免把「按钮还没渲染出来」误判成「站点没有登录入口」
+            log_print("⚠️当前页面没找到登录入口，稍等再确认一次...")
+            safe_sleep(3)
+            if not has_login_entry(page):
+                log_print("❌站点当前没有任何登录入口（登录页重定向回首页，首页也没有登录按钮/登录链接）")
+                log_page_entries(page)
+                return False
+        log_print(f"第{attempt}次尝试进入登录页")
         # 奇数轮直接开登录页，偶数轮回首页点登录按钮（保留原有两条路径）
         if attempt % 2 == 1:
             goto_quiet(page, BrowserConfig.LOGIN_URL)
@@ -283,6 +375,7 @@ def ensure_on_login_page(page, timeout: int = 240) -> bool:
                 log_print(f"   当前页面: {page.url} | 标题: {page.title()[:40]}")
             except Exception:
                 pass
+        safe_sleep(1)  # 给站点留点喘息，避免高频重试
     log_print("❌等待进入登录页超时，始终未出现登录表单 #phone_number")
     return False
 
@@ -358,6 +451,38 @@ def is_no_login_response(text: str) -> bool:
     return any(m in text for m in NO_LOGIN_MARKERS)
 
 
+def inject_cookies(context, cookies: list):
+    """把本地cookie注入浏览器context。
+    已过客户端有效期的cookie会被浏览器直接丢弃，而服务端会话可能还活着，
+    所以这里把过期时间往后续一天，让cookie照常发出去，由服务端决定认不认"""
+    if not cookies:
+        return
+    now = time.time()
+    revived = 0
+    pw_cookies = []
+    for ck in cookies:
+        item = {
+            "name": ck["name"],
+            "value": ck["value"],
+            "domain": (ck.get("domain") or "").lstrip("."),
+            "path": ck.get("path") or "/",
+        }
+        exp = ck.get("expires")
+        try:
+            exp = float(exp)
+            if exp > 0:
+                if exp <= now:
+                    exp = now + 86400
+                    revived += 1
+                item["expires"] = int(exp)
+        except (TypeError, ValueError):
+            pass
+        pw_cookies.append(item)
+    context.add_cookies(pw_cookies)
+    if revived:
+        log_print(f"⚠️有{revived}个本地cookie已过客户端有效期，仍按原值发送（服务端可能已让会话失效）")
+
+
 def build_context_from_cookies(
     chrome_exe_path: str, cookies: list, headless: bool = False
 ) -> "BrowserHolder":
@@ -377,24 +502,7 @@ def build_context_from_cookies(
         holder.context = holder.browser.new_context(
             viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
         )
-        if cookies:
-            pw_cookies = []
-            for ck in cookies:
-                item = {
-                    "name": ck["name"],
-                    "value": ck["value"],
-                    "domain": (ck.get("domain") or "").lstrip("."),
-                    "path": ck.get("path") or "/",
-                }
-                exp = ck.get("expires")
-                try:
-                    exp = float(exp)
-                    if exp > 0:
-                        item["expires"] = int(exp)
-                except (TypeError, ValueError):
-                    pass
-                pw_cookies.append(item)
-            holder.context.add_cookies(pw_cookies)
+        inject_cookies(holder.context, cookies)
         return holder
     except Exception:
         holder.close()
@@ -447,7 +555,9 @@ def get_valid_session(chrome_exe_path: str, phone: str, password: str, keyword: 
       - 无头浏览器同样过不了检测，检测页不会自动放行
       - 只有可见浏览器能过一次检测，之后所有请求沿用该浏览器通道(context.request)
     站点改版后正文(reader)接口已强制登录：匿名请求返回 {"code":0,"data":{"no_login":1}}，
-    而搜索接口匿名仍可用，所以不能再靠“搜索接口通”判断会话可用，必须确认有登录cookie"""
+    而搜索接口匿名仍可用，所以不能再靠“搜索接口通”判断会话可用，必须确认有登录cookie。
+    注意：站点可能再次改版到「没有登录入口」（登录页重定向回首页、首页无登录按钮），
+    这时登录动作没有意义，login_and_get_session 会跳过登录，直接用现有cookie继续爬"""
     saved_phone, saved = load_saved_cookies()
     use_saved = bool(saved) and saved_phone == phone.strip()
     if saved and not use_saved:
@@ -475,13 +585,14 @@ def get_valid_session(chrome_exe_path: str, phone: str, password: str, keyword: 
             holder.close()
             holder = None
     else:
-        log_print("🚀正文接口需要登录态，开始登录")
+        log_print("🚀准备登录会话（站点若已无登录入口，将直接用现有cookie爬取）")
 
     # 登录后直接沿用这个已登录、且已过WAF的浏览器通道：
     # 重开浏览器会再次触发WAF安全检测，白白让用户多滑一次滑块
-    session, holder = login_and_get_session(chrome_exe_path, phone, password)
+    # 带上本地cookie：站点若已移除登录入口，这批cookie就是唯一能用的会话
+    session, holder = login_and_get_session(chrome_exe_path, phone, password, saved)
     if holder is not None:
-        log_print("✅已登录，沿用当前浏览器通道开始爬取")
+        log_print("✅浏览器通道就绪，沿用当前通道开始爬取")
         return session, holder, True
     _, fresh = load_saved_cookies()
     log_print("⚠️登录浏览器通道不可用，改用保存的cookie新建通道")
@@ -609,8 +720,54 @@ def resolve_chrome_path(chrome_exe_path: str) -> str:
     return ""
 
 
-def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
-    """启动浏览器登录，返回(requests会话, 浏览器holder)；holder需在任务结束后close()"""
+def do_login_on_page(page, phone: str, password: str) -> bool:
+    """在当前页面上走完登录流程：进登录页→填账号密码→提交。
+    返回是否确认登录成功；站点没有登录入口时返回False（不算异常，由调用方决定后续）"""
+    if not ensure_on_login_page(page):
+        log_print("❌无法进入登录页面")
+        return False
+    if not wait_for_manual_captcha(page):
+        log_print("❌登录页验证码失败")
+        return False
+    try:
+        page.wait_for_selector("#phone_number", timeout=12000)
+    except Exception as e:
+        log_print(f"❌登录表单未出现: {e}")
+        return False
+    log_print(f"输入账号:{phone}")
+    page.fill("#phone_number", phone)
+    safe_sleep(0.3)
+    page.fill("#phone_pwd", password)
+    safe_sleep(0.3)
+    page.dispatch_event("#phone_number", "input")
+    page.dispatch_event("#phone_pwd", "input")
+    safe_sleep(0.5)
+    login_submit = page.locator("input.phone_login_btn")
+    if login_submit.count() > 0:
+        log_print("点击登录按钮")
+        try:
+            login_submit.click()
+            safe_sleep(3)
+        except Exception as e:
+            log_print(f"点击登录异常:{e}")
+    for _ in range(12):
+        check_stop()
+        if is_logged_in(page):
+            log_print("✅登录成功")
+            return True
+        if page.locator("#captcha_container, .vc_captcha_box_theme").count() > 0:
+            wait_for_manual_captcha(page, timeout=60)
+        safe_sleep(3)
+    log_print("⚠️未检测登录成功标记，继续使用当前cookie尝试")
+    return False
+
+
+def login_and_get_session(
+    chrome_exe_path: str, phone: str, password: str, saved_cookies: list = None
+):
+    """启动浏览器登录，返回(requests会话, 浏览器holder)；holder需在任务结束后close()。
+    saved_cookies：本机保存的cookie，先注入浏览器再判断登录态——
+    这样站点若已移除登录入口（无法登录），还能沿用这批cookie继续爬取"""
     holder = BrowserHolder()
     try:
         holder.playwright = sync_playwright().start()
@@ -632,6 +789,8 @@ def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
         holder.context = holder.browser.new_context(
             viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
         )
+        # 先把本地cookie注入：站点若已移除登录入口就没法登录，只能靠这批cookie
+        inject_cookies(holder.context, saved_cookies or [])
         page = holder.context.new_page()
         goto_quiet(page, BrowserConfig.HOME_URL)
         # 站点前置了WAF安全检测：先等页面（检测页 + 检测通过后的reload过渡期）真正就绪，
@@ -640,44 +799,15 @@ def login_and_get_session(chrome_exe_path: str, phone: str, password: str):
         if not wait_for_manual_captcha(page):
             raise Exception("验证码等待失败")
         if not is_logged_in(page):
-            if not ensure_on_login_page(page):
-                raise Exception("无法进入登录页面")
-            if not wait_for_manual_captcha(page):
-                raise Exception("登录页验证码失败")
-            page.wait_for_selector("#phone_number", timeout=12000)
-            log_print(f"输入账号:{phone}")
-            page.fill("#phone_number", phone)
-            safe_sleep(0.3)
-            page.fill("#phone_pwd", password)
-            safe_sleep(0.3)
-            page.dispatch_event("#phone_number", "input")
-            page.dispatch_event("#phone_pwd", "input")
-            safe_sleep(0.5)
-            login_submit = page.locator("input.phone_login_btn")
-            if login_submit.count() > 0:
-                log_print("点击登录按钮")
-                try:
-                    login_submit.click()
-                    safe_sleep(3)
-                except Exception as e:
-                    log_print(f"点击登录异常:{e}")
-            login_ok = False
-            for _ in range(12):
-                check_stop()
-                if is_logged_in(page):
-                    log_print("✅登录成功")
-                    login_ok = True
-                    break
-                if (
-                    page.locator(
-                        "#captcha_container, .vc_captcha_box_theme"
-                    ).count()
-                    > 0
-                ):
-                    wait_for_manual_captcha(page, timeout=60)
-                safe_sleep(3)
-            if not login_ok:
-                log_print("⚠️未检测登录成功标记，继续使用当前cookie尝试")
+            if has_login_entry(page):
+                do_login_on_page(page, phone, password)
+            else:
+                # 站点改版可能整块拿掉登录入口：首页没有登录按钮，登录页也重定向回首页。
+                # 此时不能卡在登录上（旧版会空转240秒后直接失败），
+                # 直接用当前会话（本机cookie + WAF通行凭证）继续爬，能不能读正文交给接口回答
+                log_print("⚠️站点当前没有登录入口（首页无登录按钮，登录页也进不去），跳过登录")
+                log_print("   将直接用现有会话继续爬取；若正文接口仍提示需要登录，说明站点改成必须登录又没有入口")
+                log_page_entries(page)
         safe_sleep(1)
         cookies = holder.context.cookies()
         save_cookies_to_file(phone, cookies)
@@ -905,7 +1035,9 @@ def crawl_magazine_images(
                 # 必须显式报错，否则会静默变成“无可用图片”，白白跳过整期还不提示原因
                 if is_no_login_response(reader_text):
                     raise Exception(
-                        "阅读器接口要求登录（返回「请登录后再做操作」），请确认保存的账号密码是否正确"
+                        "阅读器接口要求登录（返回「请登录后再做操作」）："
+                        "站点当前需要登录态，但首页没有登录按钮/登录页也进不去，无法自动登录；"
+                        "请确认账号密码是否正确，若站点已移除登录入口请反馈开发者适配"
                     )
                 if not reader_text:
                     log_print(f"⚠️p={p}阅读器接口无有效响应（可能被WAF拦截），响应为空")
