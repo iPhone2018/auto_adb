@@ -57,9 +57,9 @@ LOG_QUEUE = Queue()  # 无maxsize，put_nowait不会阻塞后台线程
 # 请求间隔(秒)：控制请求频率。站点除了认“请求像不像浏览器”，还按量限流——
 # 2026-10-08 实测：0.1秒间隔连发46个接口请求，WAF就把后续请求(含页面内fetch)全拦成403，
 # 而且拦了之后要等好几分钟才恢复。宁可慢一点，也别让整期下载半路被打断
-API_CALL_INTERVAL = 1.2  # 每次接口调用后的统一间隔(秒)
-DOWNLOAD_INTERVAL = 1.0  # 每张图片下载后的统一间隔(秒)
-READER_PAGE_INTERVAL = 1.5  # 阅读器翻页额外间隔(秒)
+API_CALL_INTERVAL = 0.5  # 每次接口调用后的统一间隔(秒)
+DOWNLOAD_INTERVAL = 0.5  # 每张图片下载后的统一间隔(秒)
+READER_PAGE_INTERVAL = 0.5  # 阅读器翻页额外间隔(秒)
 MAX_READER_PAGES = 9999  # 单期最多翻到第几页(p每轮+2)，防止站点异常时无限翻页
 MAX_RELOGIN_PER_RUN = 2  # 单次任务里正文接口报「请登录」时，最多就地重新登录几次
 
