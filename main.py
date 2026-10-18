@@ -1,9 +1,26 @@
+"""main_v2.py —— 杂志PDF下载工具（v2：requests优先 + 浏览器通道兜底）
+
+与 v1(main.py) 的差别：
+1. 界面去掉「书名」输入框，改为粘贴「采集地址」，例如
+   https://web.591adb.cn/magazine/detail/hngymyzyxy_1031982.html?_=1792144681
+   程序从地址里取出站点id，请求一次缩略图接口换成 magazine_id，再用它取往期列表。
+2. 界面只认粘贴进来的那一条 cookie（浏览器里复制整串粘进来），不登录。
+   接口请求优先用 requests 直连；但站点WAF会拦requests并返回HTML挑战页
+   （2026-10-18 实测：cookie 再新也一样），被拦时自动启动可见Chrome、
+   注入这份cookie，之后所有接口请求都改由页面自己发XHR（与 v1 相同的过WAF方式）。
+   会话被服务端提前失效时接口会返回「请登录」，程序会提示重新复制一份cookie。
+3. 图片获取方式和 v1(main.py) 完全一致：调阅读器(reader)接口并带 uf=0，
+   p=1,3,5… 每次+2，接口直接返回整页原图的地址(data.image_list)，
+   逐张下载即可，不再下载瓦片拼页。
+4. 下载图片、转PDF、水印、加密、删源文件等沿用 v1 的做法。
+"""
 import json
 import os
 import sys
 import time
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from queue import Queue, Empty
 from datetime import datetime
@@ -48,20 +65,28 @@ def get_data_dir() -> str:
 
 
 DATA_DIR = get_data_dir()
-ACCOUNT_STORE = os.path.join(DATA_DIR, "mag_account_store.json")
 CONFIG_STORE = os.path.join(DATA_DIR, "mag_config_store.json")
-COOKIE_STORE = os.path.join(DATA_DIR, "mag_cookies.json")
 LOG_FILE = os.path.join(DATA_DIR, "mag_run.log")
 TASK_STOP_EVENT = threading.Event()
 LOG_QUEUE = Queue()  # 无maxsize，put_nowait不会阻塞后台线程
-# 请求间隔(秒)：控制请求频率。站点除了认“请求像不像浏览器”，还按量限流——
-# 2026-10-08 实测：0.1秒间隔连发46个接口请求，WAF就把后续请求(含页面内fetch)全拦成403，
-# 而且拦了之后要等好几分钟才恢复。宁可慢一点，也别让整期下载半路被打断
-API_CALL_INTERVAL = 0.5  # 每次接口调用后的统一间隔(秒)
-DOWNLOAD_INTERVAL = 0.5  # 每张图片下载后的统一间隔(秒)
-READER_PAGE_INTERVAL = 0.5  # 阅读器翻页额外间隔(秒)
-MAX_READER_PAGES = 9999  # 单期最多翻到第几页(p每轮+2)，防止站点异常时无限翻页
-MAX_RELOGIN_PER_RUN = 2  # 单次任务里正文接口报「请登录」时，最多就地重新登录几次
+# 接口限速：站点按请求量限流——2026-10-08 实测 0.1秒连发46个、2026-10-16 实测
+# 50秒内约40个（≈48次/分）都会被WAF拦成 403/挑战页，且要等十几分钟才恢复。
+# 不再每次请求后固定sleep，改用令牌桶：允许小突发，长期平均不超过 API_RATE_PER_MIN。
+# 15次/分是实测安全值；想更快可以调大（如30），被拦后程序会自动降速。
+# 图片在CDN(pic.591adb.cn)，和接口限速分开算，可以并发下载。
+API_RATE_PER_MIN = 15.0  # 接口平均速率（次/分）
+API_BURST = 3            # 令牌桶允许的短时突发请求数
+API_BLOCK_COOLDOWN = 60  # 被WAF拦后至少冷却多少秒再发下一个接口请求
+IMAGE_WORKERS = 4        # 整页原图并发下载数（CDN，不受接口限速约束）
+MAX_THUMB_RETRY = 2  # 接口没拿到有效响应时，同一页最多再重试几次
+READER_PAGE_STEP = 2  # 阅读器接口一次给2页，p每次加2（站点前端就是这么翻的）
+MAX_READER_CALLS = 600  # 单期最多请求阅读器接口多少次（120页约60次，留足余量）
+READER_BLOCK_WAIT = 90   # 疑似被限流（403）时等多久再试同一页
+MAX_READER_BLOCK_RETRY = 3  # 被限流最多这样等几次，还是不行就按已收集到的继续
+# 站点「翻到头」的表现（2026-10-16 实测确认）：
+#   缩略图接口——合法JSON，但重复给一遍最后一页的图片
+#   阅读器接口——同样重复给已经收集过的页
+# 所以收尾逻辑就是「按文件名去重，接口返回的图片与已有页相同就结束」，不需要猜。
 
 
 def log_print(text: str):
@@ -91,24 +116,58 @@ def safe_sleep(sec: float):
         raise TaskStopped("TaskStopped")
 
 
-# ===================== 账号存储工具 =====================
-def load_accounts():
-    if not os.path.exists(ACCOUNT_STORE):
-        return {}
-    try:
-        with open(ACCOUNT_STORE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+class RateLimiter:
+    """令牌桶限速：允许短时突发，长期平均不超过 rate_per_min。
+    请求不再固定sleep——桶里有令牌就立即发，没有才等到下一个令牌。
+    被站点拦下时 penalize() 自动降速，连续成功后再慢慢恢复到配置的速率。"""
 
+    def __init__(self, rate_per_min: float, burst: int = 3):
+        self.base_rate = max(float(rate_per_min), 1.0) / 60.0  # 每秒令牌数
+        self.rate = self.base_rate
+        self.capacity = max(1, int(burst))
+        self.tokens = float(self.capacity)
+        self.updated = time.monotonic()
+        self.blocked_until = 0.0
+        self.successes = 0
+        self.lock = threading.Lock()
 
-def save_account(phone: str, pwd: str):
-    if not phone.strip():
-        return
-    data = load_accounts()
-    data[phone.strip()] = pwd.strip()
-    with open(ACCOUNT_STORE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    def _refill(self, now: float):
+        self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+        self.updated = now
+
+    def acquire(self):
+        """取一个令牌；桶空或处于被拦冷却期时等待。用户点停止会抛 TaskStopped"""
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                wait = self.blocked_until - now
+                if wait <= 0:
+                    self._refill(now)
+                    if self.tokens >= 1.0:
+                        self.tokens -= 1.0
+                        return
+                    wait = (1.0 - self.tokens) / max(self.rate, 1e-6)
+            safe_sleep(wait)
+
+    def penalize(self):
+        """被站点真正限流（浏览器通道也被拦）：降速+清空令牌+冷却，避免继续撞墙。
+        只降一半（有下限），连续成功后再恢复，避免一次误判把整期拖慢"""
+        with self.lock:
+            self.rate = max(self.rate * 0.5, self.base_rate * 0.5)
+            self.tokens = 0.0
+            self.updated = time.monotonic()
+            self.blocked_until = self.updated + API_BLOCK_COOLDOWN
+            self.successes = 0
+            now_rate = self.rate * 60
+        log_print(f"⚠️接口被限流，自动降速到 {now_rate:.1f} 次/分（基准 {self.base_rate * 60:.0f}）")
+
+    def reward(self):
+        """持续成功一段时间后小幅恢复，最多回到配置的基准速率"""
+        with self.lock:
+            self.successes += 1
+            if self.successes >= 10 and self.rate < self.base_rate:
+                self.rate = min(self.base_rate, self.rate * 1.5)
+                self.successes = 0
 
 
 def load_last_config():
@@ -126,76 +185,181 @@ def save_last_config(cfg: dict):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
-# ===================== Playwright 登录获取Cookie 模块 =====================
-class BrowserConfig:
-    VIEWPORT = {"width": 1920, "height": 1080}
+# ===================== 界面粘贴的Cookie解析（v2新增） =====================
+def dedupe_cookies(cookies: list) -> list:
+    """同名cookie只留最后一个：浏览器里复制的整串cookie，同名以最后一个为准"""
+    merged = {}
+    for ck in cookies:
+        merged[ck["name"]] = ck
+    return list(merged.values())
+
+
+def parse_cookie_input(text: str) -> list:
+    """把界面粘贴的cookie文本解析成 [{"name","value","domain","path"}, ...]。
+    支持三种写法：
+      1. 浏览器devtools里复制的整条cookie字符串："a=b; c=d"（可带 Cookie: 前缀、可跨行）
+      2. 本工具保存的 mag_cookies.json 格式（JSON数组，元素带name/value/domain/path）
+      3. 包了一层的 {"cookies": [...]}
+    ⚠️值一律原样保留：像 hngymyzyxy_info 的值里带 %2F、%3D%3D，站点认的就是这串原文，
+    一旦解码反而登录不上。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if text[0] in "[{":
+        data = None
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None  # 不是JSON就当普通cookie字符串继续往下解析
+        if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+            data = data["cookies"]
+        if isinstance(data, list):
+            out = []
+            for ck in data:
+                if isinstance(ck, dict) and str(ck.get("name") or "").strip():
+                    out.append({
+                        "name": str(ck["name"]).strip(),
+                        "value": str(ck.get("value") or ""),
+                        "domain": str(ck.get("domain") or "").lstrip("."),
+                        "path": ck.get("path") or "/",
+                    })
+            if out:
+                return dedupe_cookies(out)
+    raw = text
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1]
+    # 换行也当分隔符：用户从devtools复制时常常是折行的
+    raw = raw.replace("\r\n", ";").replace("\n", ";").replace("\r", ";")
+    out = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        if not name:
+            continue
+        out.append({"name": name, "value": value.strip(), "domain": "", "path": "/"})
+    return dedupe_cookies(out)
+
+
+def describe_cookies(cookies: list) -> str:
+    """日志里只说数量和cookie名，不打印cookie值（值里带登录凭证，别写进日志文件）"""
+    names = [c["name"] for c in cookies]
+    shown = "、".join(names[:8]) + ("..." if len(names) > 8 else "")
+    has_login = "有" if has_login_cookie(cookies) else "无"
+    return f"{len(cookies)}个（{shown}；登录cookie {SiteConfig.LOGIN_COOKIE_NAME}:{has_login}）"
+
+# ===================== 站点配置 =====================
+class SiteConfig:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/128.0.0.0 Safari/537.36"
     )
+    VIEWPORT = {"width": 1920, "height": 1080}
     HOME_URL = "https://web.591adb.cn/hngymyzyxy.html"
-    LOGIN_URL = "https://web.591adb.cn/login/hngymyzyxy.html"
-    LOGIN_COOKIE_NAME = "hngymyzyxy_info"  # 登录会话cookie名，用于判断本地cookie是否过期
+    LOGIN_COOKIE_NAME = "hngymyzyxy_info"  # 登录会话cookie名，用来判断粘贴的cookie里有没有登录态
     REQ_HEADERS = {
         "User-Agent": USER_AGENT,
         "Referer": "https://web.591adb.cn/",
     }
+    # 缩略图接口——一次返回18页的缩略图，p从1开始递增（用来拿总页数和页面清单）
+    THUMBLIST_URL_TMPL = (
+        "https://web.591adb.cn/magazine/thumblist/hngymyzyxy_{item_id}.html?p={p}&_={ts}"
+    )
+    # 阅读器接口——一次返回2页的**整页原图**地址，p从1开始每次+2。
+    # 与 v1(main.py) 一致走 uf=0：image_list 里一页就是一张整图，不用再拼瓦片。
+    # ⚠️p=1 与 p>1 的URL参数不同，站点前端就是这么发的，照抄才不会被打回（见 reader_url）
+    READER_URL_TMPL = (
+        "https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html"
+        "?item_id={item_id}&uf={uf}&p={p}&_={ts}"
+    )
+    READER_URL_P1_TMPL = (
+        "https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html?&p={p}&_={ts}"
+    )
+    READER_UF = 0
+    # 往期（刊期）列表接口，要的是 magazine_id
+    PAST_URL_TMPL = "https://web.591adb.cn/magazine/past/hngymyzyxy_{magazine_id}.html?_={ts}"
 
 
-def safe_goto(page, url, max_retries=3):
-    for i in range(max_retries):
-        check_stop()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            return True
-        except Exception as e:
-            log_print(f"导航尝试 {i+1}/{max_retries} 失败:{e}")
-            safe_sleep(2)
-    return False
+def build_session_from_cookies(cookies: list) -> requests.Session:
+    """把cookie列表注入requests.Session"""
+    session = requests.Session()
+    session.headers.update(SiteConfig.REQ_HEADERS)
+    for ck in cookies:
+        session.cookies.set(ck["name"], ck["value"], domain=ck.get("domain"), path=ck.get("path"))
+    return session
 
 
-LOGIN_MARKER_SELECTORS = (
-    "a.edit-password",
-    "a.logout",
-    "a.login-out",
-    "a[href*='logout']",
+def has_login_cookie(cookies: list) -> bool:
+    """本地cookie里是否存在登录cookie；没有就说明是匿名会话，必须走登录"""
+    return any(c.get("name") == SiteConfig.LOGIN_COOKIE_NAME for c in cookies)
+
+
+NO_LOGIN_MARKERS = ("请登录后再做操作", '"no_login"')
+# 站点会在服务端提前让会话失效（cookie的过期时间还没到就已经不认了），
+# 这时接口返回「请登录后再做操作」。没有浏览器就没法就地重登，只能让用户重新粘贴cookie
+COOKIE_EXPIRED_MSG = (
+    "接口要求登录（返回「请登录后再做操作」）：粘贴的Cookie已经失效了。"
+    "请到浏览器里重新登录网站，复制一份新的cookie粘到界面上再跑"
 )
-LOGIN_MARKER_TEXTS = ("退出登录", "退出", "注销")
 
 
-def is_logged_in(page) -> bool:
-    """页面上的登录态标记。
-    ⚠️站点反复改版，这些标记可能整体消失（改版后连登录按钮都没有了），
-    所以它只能当作「看起来已登录」的提示，绝不能靠它决定要不要登录：
-    真正的判断依据是接口返回（见 probe_api_available 与 reader 的 no_login 判断）"""
-    for sel in LOGIN_MARKER_SELECTORS:
-        try:
-            if page.locator(sel).count() > 0:
-                return True
-        except Exception:
-            continue
-    try:
-        for t in LOGIN_MARKER_TEXTS:
-            loc = page.get_by_text(re.compile(f"^{t}$"))
-            if loc.count() > 0 and loc.first.is_visible():
-                return True
-    except Exception:
-        pass
-    return False
+# 登录页特征：站点会话失效时，接口会被重定向到登录页（HTTP 200 + HTML），
+# 而不是返回 JSON。必须认出来，否则会被误报成「被WAF拦截」，让用户白等半小时
+LOGIN_PAGE_MARKERS = ('id="phone_number"', "phone_pwd", "phone_login_btn", "captcha_container")
+
+
+def looks_like_login_html(text: str) -> bool:
+    s = text or ""
+    return any(m in s for m in LOGIN_PAGE_MARKERS)
+
+
+def html_title(text: str) -> str:
+    """取HTML标题，只用于日志诊断"""
+    m = re.search(r"<title[^>]*>(.*?)</title>", text or "", re.I | re.S)
+    return re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+
+
+def blocked_hint(text: str) -> str:
+    """接口没返回JSON时补一句人能看懂的说明。
+    2026-10-18 实测：登录失效时站点会把接口请求跳到登录页（200 + HTML），
+    与「请求太密被WAF拦（403 + 访问被拦截）」要分开说，否则用户不知道该重登还是该等"""
+    s = text or ""
+    if looks_like_login_html(s):
+        return ("（接口返回的是登录页，说明粘贴的Cookie已经失效："
+                "请到浏览器重新登录网站，复制一份新的完整cookie粘到界面上再跑）")
+    if "访问被拦截" in s or "403" in s or "<html" in s[:200].lower():
+        return ("（接口返回的是网页而不是JSON：可能是Cookie失效被跳到了登录页，"
+                "也可能是站点安全检测拦截。请先重新登录并复制新cookie；若刚复制过，"
+                "等10~30分钟再试，期间别反复重跑——越试恢复越慢）")
+    return ""
+
+
+def is_no_login_response(text: str) -> bool:
+    """站点改版后：reader等正文接口未登录时返回
+    {"code":0,"msg":"请登录后再做操作","data":{"no_login":1}}，HTTP状态仍是200"""
+    if not text:
+        return False
+    return any(m in text for m in NO_LOGIN_MARKERS)
+
+
+# ===================== 浏览器通道（requests被WAF拦下时自动启用） =====================
+# 2026-10-18 实测：站点WAF对纯requests直连返回的是 200 + HTML 的挑战页
+# （约14KB，含 TTGCaptcha / waf-captcha-proxy / window.location.reload），
+# cookie刚登录也一样过不去；只有浏览器页面自己发出的XHR才放行。
+# 以下逻辑与 v1(main.py) 一致：可见Chrome + 页面内XHR，共用同一个浏览器过WAF。
+WAF_CAPTCHA_SELECTOR = (
+    "#vc_captcha_box, .vc_captcha_box_theme, #captcha_container, .captcha_verify_bar--title"
+)
+WAF_TEXT_MARKERS = ("安全检测", "TTGCaptcha", "waf-captcha-proxy")
+WAF_MAX_CHALLENGES = 3  # 单次任务最多配合几次滑块，超过就停，避免越滑越弹
+_waf_challenge_count = 0
 
 
 class WafChallengeLimit(RuntimeError):
-    """站点安全检测反复出现（滑完又弹）时的终止信号。
-    这时候继续跳转只会再触发一次检测，必须停下来让用户稍后再试"""
-
-
-# 单次任务里最多配合过几次安全检测。站点一旦盯上当前会话，
-# 每跳转一次页面就重新弹一次滑块，越跳越多；超过上限立刻停，不再喂它
-WAF_MAX_CHALLENGES = 3
-# 滑块出现后每轮至少留这么多秒给用户滑，别刚弹出就跳走（跳走=又弹一个）
-WAF_CHALLENGE_WAIT_MIN = 30
-_waf_challenge_count = 0
+    """站点安全检测反复出现（滑完又弹）时的终止信号"""
 
 
 def reset_waf_challenge_count():
@@ -204,52 +368,20 @@ def reset_waf_challenge_count():
 
 
 def note_waf_challenge():
-    """每遇到一次安全检测就记一笔，超过上限抛 WafChallengeLimit"""
     global _waf_challenge_count
     _waf_challenge_count += 1
     if _waf_challenge_count > WAF_MAX_CHALLENGES:
         raise WafChallengeLimit(
             f"站点安全检测已连续出现{WAF_MAX_CHALLENGES}次，每次跳转都会重新弹出滑块验证。"
             "继续重试只会一直弹验证码，程序已停止。"
-            "建议：关闭程序与浏览器窗口，等待10~30分钟让站点的拦截标记过期后再试；"
-            "期间不要反复启动，越试越容易被盯上"
+            "建议：关闭程序与浏览器窗口，等待10~30分钟后再试；期间不要反复启动，越试越容易被盯上"
         )
-
-
-WAF_CAPTCHA_SELECTOR = (
-    "#vc_captcha_box, .vc_captcha_box_theme, #captcha_container, .captcha_verify_bar--title"
-)
-# 火山引擎WAF安全检测页特征：页面返回HTTP 200且不含登录表单，只能靠内容识别
-WAF_TEXT_MARKERS = ("安全检测", "TTGCaptcha", "waf-captcha-proxy")
-
-
-def wait_for_manual_captcha(page, timeout: int = 120) -> bool:
-    try:
-        captcha = page.locator(WAF_CAPTCHA_SELECTOR)
-        if captcha.count() == 0:
-            log_print("未检测到滑动验证码")
-            return True
-        log_print("⚠️检测到滑动验证码，请手动在浏览器完成验证")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            check_stop()
-            if captcha.count() == 0 or not captcha.first.is_visible():
-                log_print("✅验证码验证通过")
-                safe_sleep(1)
-                return True
-            safe_sleep(1)
-        log_print("❌等待验证码超时")
-        return False
-    except Exception as e:
-        log_print(f"验证码检测异常:{e}")
-        return True
 
 
 def is_waf_challenge(page, strict: bool = False) -> bool:
     """当前页面是否为站点前置的WAF安全检测页。
     读不到页面（正在跳转/被abort）时按“尚未就绪”处理，让调用方继续等；
-    strict=True 时读不到就返回False——用于「数滑块次数」和「要不要再跳转」的判断，
-    避免把跳转中的空白页误当成检测页，白白记一次滑块"""
+    strict=True 时读不到就返回False，避免把跳转中的空白页误记成一次滑块"""
     try:
         if page.locator(WAF_CAPTCHA_SELECTOR).count() > 0:
             return True
@@ -259,72 +391,10 @@ def is_waf_challenge(page, strict: bool = False) -> bool:
     return any(m in html for m in WAF_TEXT_MARKERS)
 
 
-def has_login_form(page) -> bool:
-    """登录表单是否已出现（判断真实页面已就绪，而不是WAF检测页）"""
-    try:
-        return page.locator("#phone_number").count() > 0
-    except Exception:
-        return False
-
-
-LOGIN_ENTRY_SELECTORS = (
-    "a.top-login-btn",
-    "a.login-btn",
-    "a.login",
-    ".login-btn",
-    "a[href*='login']",
-)
-LOGIN_ENTRY_TEXTS = ("登录", "立即登录", "登录/注册", "用户登录")
-
-
-def has_login_entry(page) -> bool:
-    """当前页面是否还存在可用的登录入口（登录按钮/登录链接/登录表单）。
-    站点会突然整块移除登录入口：登录页重定向回首页、首页也没有登录按钮，
-    此时任何登录动作都是徒劳的，必须尽早识别出来，直接跳过登录继续爬。
-    这里不押具体选择器，找到一个可见的登录入口就算「有」"""
-    try:
-        if has_login_form(page):
-            return True
-    except Exception:
-        pass
-    for sel in LOGIN_ENTRY_SELECTORS:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                return True
-        except Exception:
-            continue
-    try:
-        for t in LOGIN_ENTRY_TEXTS:
-            loc = page.get_by_text(re.compile(f"^{t}$"))
-            if loc.count() > 0 and loc.first.is_visible():
-                return True
-    except Exception:
-        pass
-    return False
-
-
-def log_page_entries(page):
-    """站点再次改版时用来定位登录入口：把页面上可见的链接/按钮打到日志里，
-    下次改版看日志就能直接知道入口变成了什么，不用再猜"""
-    try:
-        items = page.eval_on_selector_all(
-            "a, button",
-            "els => els.filter(e => e.offsetParent !== null)"
-            ".map(e => ((e.innerText || '').trim().slice(0, 16) + ' -> ' "
-            "+ (e.getAttribute('href') || '')).slice(0, 80))"
-            ".slice(0, 40)",
-        )
-        log_print("   页面可见链接/按钮: " + " | ".join(items))
-    except Exception as e:
-        log_print(f"   页面入口信息读取失败: {e}")
-
-
 def is_page_ready(page) -> bool:
     """页面是否已真正加载出内容。
-    注意：WAF检测页通过后 successCb 会 location.reload()，reload 过渡期 DOM 为空，
-    此时 page.content() 里既没有WAF特征、也没有正文，绝不能判成“检测已通过”，
-    否则会在页面还没出来时就再次跳转，把加载中的页面打断，陷入空转"""
+    WAF检测页通过后 successCb 会 location.reload()，reload 过渡期 DOM 为空，
+    此时不能判成“检测已通过”，否则会在页面还没出来时就发请求，陷入空转"""
     try:
         if page.locator(WAF_CAPTCHA_SELECTOR).count() > 0:
             return False
@@ -339,10 +409,8 @@ def is_page_ready(page) -> bool:
 
 
 def wait_page_ready(page, timeout: int = 180) -> bool:
-    """等待页面真正就绪：WAF安全检测页、以及检测通过后的reload过渡期都算“未就绪”。
-    检测到滑块时提示用户在浏览器窗口手动完成，程序只负责等待，不做任何自动绕过。
-    就绪返回True；超时返回False（调用方自行决定后续）。
-    检测次数超过上限会抛 WafChallengeLimit —— 保证用户不会被无限滑块拖住"""
+    """等待页面真正就绪：WAF检测页、以及检测通过后的reload过渡期都算“未就绪”。
+    检测到滑块时提示用户在浏览器窗口手动完成，程序只等待，不做任何自动绕过"""
     deadline = time.time() + timeout
     notified = False
     while time.time() < deadline:
@@ -352,7 +420,6 @@ def wait_page_ready(page, timeout: int = 180) -> bool:
                 log_print("✅站点安全检测已通过，页面已加载完成")
             return True
         if not notified and is_waf_challenge(page, strict=True):
-            # 先记账：连续弹太多次就直接终止，绝不再跳转触发新的检测
             note_waf_challenge()
             log_print(
                 f"⚠️站点安全检测（火山引擎WAF）拦截：请在已打开的浏览器窗口手动完成滑块验证，"
@@ -365,10 +432,7 @@ def wait_page_ready(page, timeout: int = 180) -> bool:
 
 
 def wait_page_settled(page, extra_sec: float = 3.0):
-    """等页面自身的JS和异步请求都跑完，再去发接口请求。
-    is_page_ready 只要求正文有20个字就返回True，那会儿页面脚本往往还没跑完；
-    站点的WAF通行凭证是页面里的JS种下的，文档刚出来就发XHR最容易被当成异常流量拦掉
-    （2026-10-08 实测：首页打开正常、接口却稳定403空响应，就是这个时机）"""
+    """等页面自身JS和异步请求跑完再发接口请求——WAF通行凭证是页面里的JS种下的"""
     try:
         page.wait_for_load_state("networkidle", timeout=8000)
     except Exception:
@@ -377,7 +441,7 @@ def wait_page_settled(page, extra_sec: float = 3.0):
 
 
 def goto_quiet(page, url) -> bool:
-    """跳转并吞掉异常：WAF检测页 successCb 里的 location.reload() 会和我们的goto抢导航，
+    """跳转并吞掉异常：WAF检测页 successCb 里的 location.reload() 会和goto抢导航，
     产生 ERR_ABORTED，属正常竞态，不该中断流程"""
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -387,344 +451,8 @@ def goto_quiet(page, url) -> bool:
         return False
 
 
-def click_login_button(page) -> bool:
-    """点击首页的登录入口；站点改版可能换掉选择器，
-    所以先按原选择器点，点不到再按「登录」文字兜底找一次"""
-    candidates = [page.locator("a.top-login-btn")]
-    for t in LOGIN_ENTRY_TEXTS:
-        candidates.append(page.get_by_text(re.compile(f"^{t}$")))
-    for loc in candidates:
-        try:
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click()
-                safe_sleep(2)
-                return True
-        except Exception as e:
-            log_print(f"点击登录按钮异常:{e}")
-    return False
-
-
-def ensure_on_login_page(page, timeout: int = 240) -> bool:
-    """进入登录页：站点前置了WAF安全检测，且检测通过后页面还会reload，
-    所以每次跳转后都要先等页面真正就绪，再看登录表单在不在。
-    站点若已整块移除登录入口（登录页重定向回首页、首页也没有登录按钮），
-    这里会尽快判定并退出，不再空转重试（旧版会在240秒里疯狂跳转几十次）"""
-    log_print("进入登录页面")
-    deadline = time.time() + timeout
-    attempt = 0
-    while time.time() < deadline:
-        check_stop()
-        if has_login_form(page):
-            log_print("成功进入登录页")
-            return True
-        attempt += 1
-        # 两条路径都试过、页面确实加载出来了、却找不到任何登录入口
-        # → 站点当前不提供登录，再跳多少次也没用，立即结束
-        if attempt > 2 and is_page_ready(page) and not has_login_entry(page):
-            # 登录入口可能是异步渲染出来的（SPA先出正文、后出按钮），
-            # 所以先等一会儿再确认一次，避免把「按钮还没渲染出来」误判成「站点没有登录入口」
-            log_print("⚠️当前页面没找到登录入口，稍等再确认一次...")
-            safe_sleep(3)
-            if not has_login_entry(page):
-                log_print("❌站点当前没有任何登录入口（登录页重定向回首页，首页也没有登录按钮/登录链接）")
-                log_page_entries(page)
-                return False
-        # 滑块正挂在屏幕上时本轮不跳转：用户刚滑对的那一页一旦被我们跳走，
-        # 站点会立刻再弹一个滑块，用户就会陷入「滑不完」的死循环
-        if is_waf_challenge(page, strict=True):
-            log_print("⚠️页面正卡在安全检测上，本轮不跳转，继续等待滑块验证")
-        else:
-            log_print(f"第{attempt}次尝试进入登录页")
-            # 奇数轮直接开登录页，偶数轮回首页点登录按钮（保留原有两条路径）
-            if attempt % 2 == 1:
-                goto_quiet(page, BrowserConfig.LOGIN_URL)
-            else:
-                goto_quiet(page, BrowserConfig.HOME_URL)
-                click_login_button(page)
-        wait_page_ready(page, timeout=max(WAF_CHALLENGE_WAIT_MIN, int(deadline - time.time())))
-        if not has_login_form(page):
-            try:
-                log_print(f"   当前页面: {page.url} | 标题: {page.title()[:40]}")
-            except Exception:
-                pass
-        safe_sleep(1)  # 给站点留点喘息，避免高频重试
-    log_print("❌等待进入登录页超时，始终未出现登录表单 #phone_number")
-    return False
-
-
-def load_saved_cookies():
-    """读取本地保存的cookie，返回(账号, cookie列表)；无文件或损坏返回("", [])"""
-    if not os.path.exists(COOKIE_STORE):
-        return "", []
-    try:
-        with open(COOKIE_STORE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data.get("phone", ""), data.get("cookies") or []
-    except Exception as e:
-        log_print(f"⚠️读取本地cookie失败: {e}")
-    return "", []
-
-
-def save_cookies_to_file(phone: str, cookies: list):
-    """登录成功后把cookie保存到本地"""
-    try:
-        # 保护已有登录态：新会话里没有登录cookie、而本地文件里有，说明这次拿到的是
-        # 匿名会话（比如换WAF凭证后的临时上下文），不能拿它把有效的登录cookie冲掉
-        old_phone, old = load_saved_cookies()
-        if old and has_login_cookie(old) and not has_login_cookie(cookies or []):
-            log_print("⚠️本次会话不含登录cookie，为保住本地已有的登录态，不覆盖本地文件")
-            return
-        payload = {
-            "phone": phone.strip(),
-            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "cookies": cookies,
-        }
-        with open(COOKIE_STORE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        log_print(f"✅Cookie已保存到本地 {COOKIE_STORE}")
-    except Exception as e:
-        log_print(f"⚠️Cookie保存失败: {e}")
-
-
-def build_session_from_cookies(cookies: list) -> requests.Session:
-    """把cookie列表注入requests.Session"""
-    session = requests.Session()
-    session.headers.update(BrowserConfig.REQ_HEADERS)
-    for ck in cookies:
-        session.cookies.set(ck["name"], ck["value"], domain=ck.get("domain"), path=ck.get("path"))
-    return session
-
-
-def cookies_statically_expired(cookies: list) -> bool:
-    """静态判断：关键登录cookie的expires是否已过；会话型cookie(expires=-1)交给动态探测"""
-    now = time.time()
-    for c in cookies:
-        if c.get("name") != BrowserConfig.LOGIN_COOKIE_NAME:
-            continue
-        exp = c.get("expires")
-        try:
-            exp = float(exp)
-        except (TypeError, ValueError):
-            return True  # 字段异常，保守视为过期
-        if exp < 0:
-            return False  # 会话型cookie，存活时间由服务端决定，交给动态探测
-        return exp <= now
-    return False
-
-
-def has_login_cookie(cookies: list) -> bool:
-    """本地cookie里是否存在登录cookie；没有就说明是匿名会话，必须走登录"""
-    return any(c.get("name") == BrowserConfig.LOGIN_COOKIE_NAME for c in cookies)
-
-
-NO_LOGIN_MARKERS = ("请登录后再做操作", '"no_login"')
-
-
-def is_no_login_response(text: str) -> bool:
-    """站点改版后：reader等正文接口未登录时返回
-    {"code":0,"msg":"请登录后再做操作","data":{"no_login":1}}，HTTP状态仍是200"""
-    if not text:
-        return False
-    return any(m in text for m in NO_LOGIN_MARKERS)
-
-
-def inject_cookies(context, cookies: list):
-    """把本地cookie注入浏览器context。
-    已过客户端有效期的cookie会被浏览器直接丢弃，而服务端会话可能还活着，
-    所以这里把过期时间往后续一天，让cookie照常发出去，由服务端决定认不认"""
-    if not cookies:
-        return
-    now = time.time()
-    revived = 0
-    pw_cookies = []
-    for ck in cookies:
-        item = {
-            "name": ck["name"],
-            "value": ck["value"],
-            "domain": (ck.get("domain") or "").lstrip("."),
-            "path": ck.get("path") or "/",
-        }
-        exp = ck.get("expires")
-        try:
-            exp = float(exp)
-            if exp > 0:
-                if exp <= now:
-                    exp = now + 86400
-                    revived += 1
-                item["expires"] = int(exp)
-        except (TypeError, ValueError):
-            pass
-        pw_cookies.append(item)
-    context.add_cookies(pw_cookies)
-    if revived:
-        log_print(f"⚠️有{revived}个本地cookie已过客户端有效期，仍按原值发送（服务端可能已让会话失效）")
-
-
-def build_context_from_cookies(
-    chrome_exe_path: str, cookies: list, headless: bool = False
-) -> "BrowserHolder":
-    """启动浏览器并注入cookie，返回holder；失败会抛异常。
-    默认可见模式：站点前置了火山引擎WAF，实测无头浏览器过不了安全检测
-    （检测页不会自动放行），只有可见浏览器能过一次检测后正常访问"""
-    holder = BrowserHolder()
-    try:
-        holder.playwright = sync_playwright().start()
-        launch_opt = {"headless": headless}
-        resolved = resolve_chrome_path(chrome_exe_path)
-        if resolved:
-            launch_opt["executable_path"] = resolved
-        else:
-            launch_opt["channel"] = "chrome"
-        holder.browser = holder.playwright.chromium.launch(**launch_opt)
-        holder.context = holder.browser.new_context(
-            viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
-        )
-        inject_cookies(holder.context, cookies)
-        return holder
-    except Exception:
-        holder.close()
-        raise
-
-
-def probe_api_available(holder, keyword: str = "") -> bool:
-    """用浏览器通道请求搜索接口，能拿到正常JSON(code=1)才算通道可用。
-    站点改版后 a.edit-password/a.logout 等登录态标记已消失，登录页还会把已认证的会话重定向回首页，
-    所以不能再靠“登录标记”判断，只能看接口是否真的可用。
-    ⚠️必须先让浏览器打开首页跑一次JS过掉WAF安全检测，否则接口拿回的是检测页"""
-    try:
-        # 复用常驻页面：既省掉一次跳转（少一次弹滑块的机会），也是后面爬取时发接口请求的通道
-        page = ensure_work_page(holder)
-        if page is None:
-            log_print("⚠️浏览器通道：拿不到可用页面，无法探测接口")
-            return False
-        ts = int(time.time() * 1000)
-        url = (
-            f"https://web.591adb.cn/search/hngymyzyxy.html?st=1&page_num=1"
-            f"&keywords={requests.utils.quote(keyword or '期刊')}&withCount=1&ts={ts}"
-        )
-        headers = dict(BrowserConfig.REQ_HEADERS)
-        headers.update(
-            {"x-requested-with": "XMLHttpRequest", "sec-fetch-mode": "cors", "priority": "u=1,i"}
-        )
-        # 由页面自己发（context.request 会被站点WAF拦成403空响应）
-        status, text = fetch_text_in_page(page, url, headers, timeout=30)
-        if status != 200 or not text.strip():
-            # 空响应最常见的原因就是被WAF拦了。以前这里直接json.loads("")，
-            # 用户只看到一句 "Expecting value: line 1 column 1 (char 0)"，毫无信息量
-            log_print(
-                f"⚠️浏览器通道搜索接口返回 HTTP {status}，响应体{len(text)}字节"
-                + ("（空响应，多为站点WAF安全检测拦截）" if not text.strip() else "")
-            )
-            return False
-        data = json.loads(text)
-        if data.get("code") == 1:
-            return True
-        log_print(f"⚠️搜索接口返回异常: {str(data)[:200]}")
-        return False
-    except WafChallengeLimit:
-        raise  # 滑块弹太多次，必须终止任务，不能被当成普通探测失败吞掉
-    except Exception as e:
-        log_print(f"⚠️浏览器通道接口探测失败: {e}")
-        return False
-    # 注意：这里**不能**关页面。它就是后面爬取时发接口请求的常驻页面，
-    # 关掉再开=多跳转一次=站点可能再弹一次滑块（旧版这里是每次探测都新开一个页面再关掉）
-
-
-def get_valid_session(chrome_exe_path: str, phone: str, password: str, keyword: str = ""):
-    """获取(requests会话, 浏览器holder, prefer_pw恒为True)。
-    站点已加火山引擎WAF安全检测，实测结论：
-      - requests 被拦，返回检测页而非接口数据
-      - 无头浏览器同样过不了检测，检测页不会自动放行
-      - 只有可见浏览器能过一次检测，之后所有接口请求都由**页面自己fetch**发出
-        （2026-10-08起：驱动进程的 context.request 会被WAF拦成403空响应，页面自己发的才放行）
-    站点改版后正文(reader)接口已强制登录：匿名请求返回 {"code":0,"data":{"no_login":1}}，
-    而搜索接口匿名仍可用，所以不能再靠“搜索接口通”判断会话可用。
-    本地cookie的时间戳只说明「客户端还没到期」，站点会提前在服务端让会话失效
-    （2026-10-10 实测：cookie 23:26 才到期，23:18 正文接口已报「请登录后再做操作」），
-    因此本函数只能在开跑前排除明显无效的cookie，真正的登录态由 crawl_magazine_images
-    按正文接口的返回判定，需要时就地重新登录（relogin_in_holder）。
-    注意：站点可能再次改版到「没有登录入口」（登录页重定向回首页、首页无登录按钮），
-    这时登录动作没有意义，login_and_get_session 会跳过登录，直接用现有cookie继续爬"""
-    saved_phone, saved = load_saved_cookies()
-    use_saved = bool(saved) and saved_phone == phone.strip()
-    if saved and not use_saved:
-        log_print("⚠️本地cookie属于其他账号，忽略本地cookie")
-        saved = []
-        use_saved = False
-    elif not saved:
-        log_print("本地无保存的cookie，需要登录")
-    elif cookies_statically_expired(saved):
-        log_print("⚠️本地cookie的时间戳已过期，需要重新登录")
-
-    # 只有本地存在有效登录cookie时，才允许跳过登录
-    can_reuse = use_saved and has_login_cookie(saved) and not cookies_statically_expired(saved)
-    holder = None
-    if can_reuse:
-        try:
-            holder = build_context_from_cookies(chrome_exe_path, saved)
-            if probe_api_available(holder, keyword):
-                # ⚠️搜索接口匿名也能通，所以这次探测只证明「浏览器通道 + WAF通行」没问题，
-                # 证明不了登录态还在。登录态一律以正文(reader)接口的返回为准：
-                # 真失效了，爬取时第一次请求正文就会提示登录，届时会就地重新登录
-                log_print("✅浏览器通道验证通过（本地cookie已注入，登录态以正文接口返回为准）")
-                return build_session_from_cookies(saved), holder, True
-            # 这里**不要**去「丢掉WAF凭证重开页面」：那样等于把用户刚滑过的那一页跳走，
-            # 站点会立刻再弹一个滑块。直接按登录流程继续就行
-            log_print("⚠️本地登录cookie已失效，改为重新登录")
-        except (TaskStopped, WafChallengeLimit):
-            if holder is not None:
-                holder.close()
-            raise
-        except Exception as e:
-            log_print(f"⚠️浏览器通道建立失败: {e}，改为登录")
-            if holder is not None:
-                holder.close()
-                holder = None
-    else:
-        log_print("🚀准备登录会话（站点若已无登录入口，将直接用现有cookie爬取）")
-
-    # 登录后直接沿用这个已登录、且已过WAF的浏览器通道：
-    # 重开浏览器会再次触发WAF安全检测，白白让用户多滑一次滑块。
-    # 所以上面探测失败时也**不关**holder，把它交给登录流程继续用同一个浏览器：
-    # 关掉重开会换浏览器指纹，站点就会再弹一次滑块，用户得反复滑
-    # 带上本地cookie：站点若已移除登录入口，这批cookie就是唯一能用的会话
-    try:
-        session, holder = login_and_get_session(chrome_exe_path, phone, password, saved, holder)
-    except (TaskStopped, WafChallengeLimit):
-        # 用户点了停止 / 滑块弹太多要终止：必须放行，不能退化成“改用本地cookie继续爬”
-        if holder is not None:
-            holder.close()
-        raise
-    except Exception as e:
-        # 登录/开浏览器本身失败（验证码超时、Chrome起不来等）不该让整个任务直接死掉，
-        # 本地cookie + 已过检测的会话还有机会继续爬
-        log_print(f"⚠️登录流程失败: {e}，改用本地保存的cookie继续")
-        _, fresh = load_saved_cookies()
-        if holder is None:
-            try:
-                holder = build_context_from_cookies(chrome_exe_path, fresh)
-            except WafChallengeLimit:
-                raise
-            except Exception as e2:
-                log_print(f"⚠️浏览器通道启动失败: {e2}")
-        return build_session_from_cookies(fresh), holder, True
-    if holder is not None:
-        log_print("✅浏览器通道就绪，沿用当前通道开始爬取")
-        return session, holder, True
-    _, fresh = load_saved_cookies()
-    log_print("⚠️登录浏览器通道不可用，改用保存的cookie新建通道")
-    try:
-        holder = build_context_from_cookies(chrome_exe_path, fresh)
-        log_print("✅已启动浏览器通道，开始爬取")
-    except Exception as e:
-        log_print(f"⚠️登录后浏览器通道启动失败: {e}")
-    return build_session_from_cookies(fresh), holder, True
-
-
 # 用 XMLHttpRequest 而不是 fetch：站点WAF被惹到时会把XHR吊住不放（页面里弹滑块慢慢等），
-# fetch 的 AbortController 会被站点脚本劫持、超时形同虚设（2026-10-08 实测卡了3分钟没返回）。
-# xhr.timeout 是浏览器原生超时，站点脚本改不了，到点必定返回
+# fetch 的 AbortController 会被站点脚本劫持、超时形同虚设；xhr.timeout 是浏览器原生超时
 _FETCH_IN_PAGE_JS = """({url, headers, timeout}) => {
     return new Promise((resolve) => {
         const x = new XMLHttpRequest();
@@ -751,9 +479,7 @@ _FETCH_IN_PAGE_JS = """({url, headers, timeout}) => {
 
 def fetch_text_in_page(page, url: str, headers: dict = None, timeout: float = 30):
     """用页面自身的网络栈发接口请求，返回(status, 响应文本)。
-    ⚠️2026-10-08 实测：站点的WAF会拒掉「驱动进程」发出的请求——context.request 一律 403 且响应体为空，
-    而页面自己 fetch 同一个URL是 200；首页、登录表单这些浏览器发出的请求也一律正常。
-    所以接口请求必须由页面自己发，跟站点前端发XHR完全一样"""
+    站点WAF会拒掉驱动进程发出的请求，只有页面自己发的才放行"""
     try:
         res = page.evaluate(
             _FETCH_IN_PAGE_JS,
@@ -764,41 +490,14 @@ def fetch_text_in_page(page, url: str, headers: dict = None, timeout: float = 30
     return int(res.get("status") or 0), res.get("body") or ""
 
 
-def ensure_work_page(holder):
-    """取（或创建）一个停在站点首页的常驻页面，所有接口请求都由这个页面自己发出去。
-    能复用就复用：重开页面=再跳转一次=站点可能再弹一次滑块"""
-    if holder is None or holder.context is None:
-        return None
-    page = getattr(holder, "work_page", None)
-    if page is not None:
-        try:
-            if not page.is_closed():
-                return page
-        except Exception:
-            pass
-    try:
-        page = holder.context.new_page()
-        holder.work_page = page
-        goto_quiet(page, BrowserConfig.HOME_URL)
-        if not wait_page_ready(page):
-            log_print("⚠️接口请求页面未能就绪，接口可能仍然失败")
-        wait_page_settled(page)  # 等页面JS跑完，别抢在它前面发接口请求
-        return page
-    except WafChallengeLimit:
-        raise
-    except Exception as e:
-        log_print(f"⚠️创建接口请求页面失败: {e}")
-        return None
-
-
 class BrowserHolder:
-    """保持Playwright浏览器在爬取期间存活，用于接口被WAF拦截时回退到浏览器通道；用完必须close()"""
+    """保持浏览器在爬取期间存活；用完必须close()。按需启动，不启动就不占资源"""
 
     def __init__(self):
         self.playwright = None
         self.browser = None
         self.context = None
-        self.work_page = None  # 常驻页面：接口请求由它自己发（见 ensure_work_page）
+        self.work_page = None
 
     def close(self):
         for obj in (self.work_page, self.context, self.browser):
@@ -814,156 +513,8 @@ class BrowserHolder:
                 pass
 
 
-class ApiClient:
-    """接口请求封装：优先requests；被拦时切浏览器通道。
-    ⚠️浏览器通道 = **页面自身fetch**（pw_page），不是 context.request：
-    站点WAF会拒掉驱动进程发出的请求（403空响应），只有浏览器页面自己发的才放行"""
-
-    def __init__(
-        self, session: requests.Session = None, pw_context=None,
-        prefer_pw: bool = False, pw_page=None,
-    ):
-        self.session = session
-        self.pw_context = pw_context
-        self.pw_page = pw_page
-        self._scratch_page = None  # 给跨域图片下载用的备用页面（导航取字节，不受CORS限制）
-        # 浏览器通道不存在时不能只认浏览器通道：否则每个请求都以“无浏览器通道可用”
-        # 失败，连requests都不试，搜索接口会直接报“请求失败”
-        self.use_pw = prefer_pw and (pw_page is not None or pw_context is not None)
-        if self.use_pw:
-            log_print("接口请求由浏览器页面自己发出（跳过requests）")
-        elif prefer_pw:
-            log_print("⚠️没有可用的浏览器通道，本次改用requests直连")
-
-    def _switch_to_pw(self) -> bool:
-        """切到浏览器通道；没有浏览器通道就不切，继续留在requests上重试"""
-        if self.pw_page is None and self.pw_context is None:
-            return False
-        self.use_pw = True
-        return True
-
-    def _scratch(self):
-        """取一个用于下载的备用页面：跨域图片没法用页面内fetch（CORS读不到body），
-        但让浏览器自己导航过去取字节不受CORS限制"""
-        try:
-            if self._scratch_page is not None and not self._scratch_page.is_closed():
-                return self._scratch_page
-        except Exception:
-            pass
-        if self.pw_context is None:
-            return None
-        try:
-            self._scratch_page = self.pw_context.new_page()
-            return self._scratch_page
-        except Exception as e:
-            log_print(f"⚠️创建下载页面失败: {e}")
-            return None
-
-    @staticmethod
-    def _looks_blocked(ct: str, body: str) -> bool:
-        ct = (ct or "").lower()
-        if "json" in ct or (body or "").lstrip().startswith("{"):
-            return False
-        # HTML只有阅读器的正常HTML(含slider-img)不算被拦
-        return "slider-img" not in (body or "")
-
-    def get_text(self, url, headers=None, timeout=30, retries=2) -> str:
-        """对外统一入口：每次接口调用后固定间隔 API_CALL_INTERVAL，控制请求频率"""
-        body = self._request_text(url, headers, timeout, retries)
-        safe_sleep(API_CALL_INTERVAL)
-        return body
-
-    def _request_text(self, url, headers=None, timeout=30, retries=2) -> str:
-        for attempt in range(retries + 1):
-            check_stop()
-            if not self.use_pw and self.session is not None:
-                try:
-                    resp = self.session.get(url, headers=headers, timeout=timeout)
-                    body = resp.text
-                    if not self._looks_blocked(resp.headers.get("content-type"), body):
-                        return body
-                    log_print(f"⚠️requests返回异常内容 status={resp.status_code}，疑似被WAF拦截")
-                    log_print(f"   响应片段: {(body or '')[:200]}")
-                    if self._switch_to_pw():
-                        log_print("   →已切换浏览器通道")
-                except Exception as e:
-                    log_print(f"⚠️requests请求异常:{e}")
-                    if self._switch_to_pw():
-                        log_print("   →已切换浏览器通道")
-            page = self.pw_page
-            if page is not None:
-                status, body = fetch_text_in_page(page, url, headers, timeout)
-                if status == 200 and body.strip() and not self._looks_blocked("", body):
-                    return body
-                if status == 0 and "超时" in (body or ""):
-                    # 请求被站点吊住了：多半个页面里正挂着滑块。这时候重试只会再挂一个请求、
-                    # 再弹一次验证码，必须立刻收手
-                    log_print("❌接口请求被站点挂起（浏览器窗口里多半正在弹滑块验证）")
-                    log_print("   站点当前不放行这台机器，已停止重试；请关掉程序等待30分钟以上再试")
-                    return ""
-                log_print(f"⚠️浏览器通道响应异常 status={status}，第{attempt + 1}/{retries + 1}次尝试")
-                log_print(f"   响应片段: {(body or '')[:200]}")
-            elif self.pw_context is not None:
-                # 没有常驻页面时的老路（驱动进程发请求，站点收紧后多半会403，仅作兜底）
-                try:
-                    # 注意：Playwright的timeout单位是毫秒
-                    resp = self.pw_context.request.get(url, headers=headers or {}, timeout=timeout * 1000)
-                    body = resp.text()
-                    if resp.ok and not self._looks_blocked(resp.headers.get("content-type"), body):
-                        return body
-                    log_print(f"⚠️浏览器通道响应异常 status={resp.status}，第{attempt + 1}/{retries + 1}次尝试")
-                    log_print(f"   响应片段: {(body or '')[:200]}")
-                except Exception as e:
-                    log_print(f"⚠️浏览器通道请求异常:{e}，第{attempt + 1}/{retries + 1}次尝试")
-            else:
-                log_print(f"⚠️无浏览器通道可用，第{attempt + 1}/{retries + 1}次尝试")
-            safe_sleep(2)
-        return ""
-
-    def get_bytes(self, url, timeout=30):
-        """下载二进制内容，返回bytes或None。
-        图片在 pic.591adb.cn（跨域），WAF没拦它时 context.request 最快；
-        被拦或异常时再用浏览器导航取字节（跨域读不到body的限制对导航不适用）"""
-        if not self.use_pw and self.session is not None:
-            try:
-                resp = self.session.get(url, timeout=timeout)
-                resp.raise_for_status()
-                return resp.content
-            except Exception:
-                self._switch_to_pw()
-        if self.pw_context is not None:
-            try:
-                # 注意：Playwright的timeout单位是毫秒
-                resp = self.pw_context.request.get(url, timeout=timeout * 1000)
-                if resp.ok:
-                    return resp.body()
-                log_print(f"⚠️浏览器通道下载 status={resp.status}，改用浏览器导航下载")
-            except Exception as e:
-                log_print(f"⚠️浏览器通道下载异常:{e}，改用浏览器导航下载")
-        return self._download_by_navigation(url, timeout)
-
-    def _download_by_navigation(self, url, timeout=30):
-        """让浏览器自己导航到图片地址并取回字节：这是浏览器网络栈发出的请求，
-        所以能拿到服务端正常放行的内容（页面内fetch读不到跨域响应体，导航没有这个限制）"""
-        page = self._scratch()
-        if page is None:
-            return None
-        try:
-            resp = page.goto(url, wait_until="load", timeout=timeout * 1000)
-            if resp is None:
-                log_print("⚠️浏览器导航下载失败：没有响应")
-                return None
-            if not resp.ok:
-                log_print(f"⚠️浏览器导航下载失败 status={resp.status}")
-                return None
-            return resp.body()
-        except Exception as e:
-            log_print(f"⚠️浏览器导航下载异常:{e}")
-            return None
-
-
-def resolve_chrome_path(chrome_exe_path: str) -> str:
-    """解析可用的Chrome路径：优先用户指定的；无效时尝试系统常见安装路径（mac/win）；都不存在返回空串"""
+def resolve_chrome_path(chrome_exe_path: str = "") -> str:
+    """解析可用的Chrome路径：优先用户指定的；无效时尝试系统常见安装路径（mac/win）"""
     if chrome_exe_path and os.path.exists(chrome_exe_path):
         return chrome_exe_path
     candidates = []
@@ -981,211 +532,694 @@ def resolve_chrome_path(chrome_exe_path: str) -> str:
     return ""
 
 
-def do_login_on_page(page, phone: str, password: str) -> bool:
-    """在当前页面上走完登录流程：进登录页→填账号密码→提交。
-    返回是否确认登录成功；站点没有登录入口时返回False（不算异常，由调用方决定后续）"""
-    if not ensure_on_login_page(page):
-        log_print("❌无法进入登录页面")
-        return False
-    if not wait_for_manual_captcha(page):
-        log_print("❌登录页验证码失败")
-        return False
-    try:
-        page.wait_for_selector("#phone_number", timeout=12000)
-    except Exception as e:
-        log_print(f"❌登录表单未出现: {e}")
-        return False
-    log_print(f"输入账号:{phone}")
-    page.fill("#phone_number", phone)
-    safe_sleep(0.3)
-    page.fill("#phone_pwd", password)
-    safe_sleep(0.3)
-    page.dispatch_event("#phone_number", "input")
-    page.dispatch_event("#phone_pwd", "input")
-    safe_sleep(0.5)
-    login_submit = page.locator("input.phone_login_btn")
-    if login_submit.count() > 0:
-        log_print("点击登录按钮")
+def inject_cookies(context, cookies: list):
+    """把界面粘贴的cookie注入浏览器context。
+    粘贴来的cookie没有domain，统一按站点主机注入；已过客户端有效期的往后续一天，
+    让cookie照常发出去，由服务端决定认不认"""
+    if not cookies:
+        return
+    now = time.time()
+    revived = 0
+    pw_cookies = []
+    for ck in cookies:
+        item = {
+            "name": ck["name"],
+            "value": ck["value"],
+            "domain": (ck.get("domain") or "web.591adb.cn").lstrip("."),
+            "path": ck.get("path") or "/",
+        }
+        exp = ck.get("expires")
         try:
-            login_submit.click()
-            safe_sleep(3)
-        except Exception as e:
-            log_print(f"点击登录异常:{e}")
-    for _ in range(12):
-        check_stop()
-        if is_logged_in(page):
-            log_print("✅登录成功")
-            return True
-        if page.locator("#captcha_container, .vc_captcha_box_theme").count() > 0:
-            wait_for_manual_captcha(page, timeout=60)
-        safe_sleep(3)
-    log_print("⚠️未检测登录成功标记，继续使用当前cookie尝试")
-    return False
+            exp = float(exp)
+            if exp > 0:
+                if exp <= now:
+                    exp = now + 86400
+                    revived += 1
+                item["expires"] = int(exp)
+        except (TypeError, ValueError):
+            pass
+        pw_cookies.append(item)
+    context.add_cookies(pw_cookies)
+    if revived:
+        log_print(f"⚠️有{revived}个cookie已过客户端有效期，仍按原值发送（服务端可能已让会话失效）")
 
 
-def relogin_in_holder(holder, phone: str, password: str) -> bool:
-    """在**已经开着的**浏览器里就地重新登录，返回是否确认登录成功。
-    用在「本地cookie看着没过期、服务端却已让会话失效」的场景（正文接口返回
-    「请登录后再做操作」）——这是唯一能确认会话真假的判据，见 crawl_magazine_images。
-    绝不开第二个浏览器：换浏览器指纹会让站点再弹一次滑块；
-    登录页用新标签页打开，不碰爬取用的常驻页面"""
-    if holder is None or holder.context is None:
-        log_print("⚠️没有可用的浏览器通道，无法重新登录")
+def ensure_browser(holder: "BrowserHolder", cookies: list) -> bool:
+    """按需启动可见Chrome并注入cookie；失败抛异常，由调用方决定是否继续用requests"""
+    if holder is None:
         return False
-    page = None
+    if holder.context is not None:
+        return True
+    log_print("🌐requests被站点WAF拦下，正在启动浏览器通道（窗口里若弹滑块请手动滑一下）")
+    try:
+        holder.playwright = sync_playwright().start()
+        launch_opt = {"headless": False}
+        resolved = resolve_chrome_path("")
+        if resolved:
+            launch_opt["executable_path"] = resolved
+            log_print(f"✅使用Chrome: {resolved}")
+        else:
+            launch_opt["channel"] = "chrome"
+        holder.browser = holder.playwright.chromium.launch(**launch_opt)
+        holder.context = holder.browser.new_context(
+            viewport=SiteConfig.VIEWPORT, user_agent=SiteConfig.USER_AGENT
+        )
+        inject_cookies(holder.context, cookies or [])
+        return True
+    except Exception:
+        holder.close()
+        raise
+
+
+def ensure_work_page(holder):
+    """取（或创建）一个停在站点首页的常驻页面，所有接口请求都由这个页面自己发。
+    能复用就复用：重开页面=再跳转一次=站点可能再弹一次滑块"""
+    if holder is None or holder.context is None:
+        return None
+    page = getattr(holder, "work_page", None)
+    if page is not None:
+        try:
+            if not page.is_closed():
+                return page
+        except Exception:
+            pass
     try:
         page = holder.context.new_page()
-        ok = do_login_on_page(page, phone, password)
-        if ok:
-            safe_sleep(1)
-            # 新会话的cookie要存回本地：否则下次任务又拿着失效的旧cookie，白跑一趟
-            save_cookies_to_file(phone, holder.context.cookies())
-        return ok
-    except (TaskStopped, WafChallengeLimit):
+        holder.work_page = page
+        goto_quiet(page, SiteConfig.HOME_URL)
+        if not wait_page_ready(page):
+            log_print("⚠️接口请求页面未能就绪，接口可能仍然失败")
+        wait_page_settled(page)
+        return page
+    except WafChallengeLimit:
         raise
     except Exception as e:
-        log_print(f"⚠️重新登录异常: {e}")
-        return False
-    finally:
-        if page is not None:
-            try:
-                page.close()
-            except Exception:
-                pass
-
-
-def login_and_get_session(
-    chrome_exe_path: str, phone: str, password: str, saved_cookies: list = None,
-    holder: "BrowserHolder" = None,
-):
-    """登录并返回(requests会话, 浏览器holder)；holder需在任务结束后close()。
-    saved_cookies：本机保存的cookie，先注入浏览器再判断登录态——
-    这样站点若已移除登录入口（无法登录），还能沿用这批cookie继续爬取。
-    holder：已存在、且已经通过WAF安全检测的浏览器通道。传进来就复用它，
-    绝不再开第二个浏览器——重开浏览器会换指纹，站点会重新弹一次滑块验证"""
-    reuse = holder is not None and holder.context is not None
-    holder = holder if reuse else BrowserHolder()
-    try:
-        if reuse:
-            log_print("♻️复用已通过安全检测的浏览器通道，不再重开浏览器（避免再次弹滑块）")
-        else:
-            holder.playwright = sync_playwright().start()
-            launch_opt = {"headless": False}
-            resolved = resolve_chrome_path(chrome_exe_path)
-            if resolved:
-                launch_opt["executable_path"] = resolved
-                if chrome_exe_path and os.path.normpath(chrome_exe_path) != os.path.normpath(resolved):
-                    log_print(f"⚠️指定的Chrome路径无效，自动使用: {resolved}")
-                else:
-                    log_print(f"✅使用指定的Chrome: {resolved}")
-            else:
-                launch_opt["channel"] = "chrome"
-                if chrome_exe_path:
-                    log_print(f"⚠️指定的Chrome路径不存在，改用系统Chrome: {chrome_exe_path}")
-                else:
-                    log_print("未指定Chrome路径，使用系统Chrome")
-            holder.browser = holder.playwright.chromium.launch(**launch_opt)
-            holder.context = holder.browser.new_context(
-                viewport=BrowserConfig.VIEWPORT, user_agent=BrowserConfig.USER_AGENT
-            )
-            # 先把本地cookie注入：站点若已移除登录入口就没法登录，只能靠这批cookie
-            inject_cookies(holder.context, saved_cookies or [])
-        page = ensure_work_page(holder) or holder.context.new_page()
-        goto_quiet(page, BrowserConfig.HOME_URL)
-        # 站点前置了WAF安全检测：先等页面（检测页 + 检测通过后的reload过渡期）真正就绪，
-        # 再判断登录态，否则会把检测页/空白页误判成“未登录”
-        wait_page_ready(page)
-        if not wait_for_manual_captcha(page):
-            raise Exception("验证码等待失败")
-        if not is_logged_in(page):
-            if has_login_entry(page):
-                do_login_on_page(page, phone, password)
-            else:
-                # 站点改版可能整块拿掉登录入口：首页没有登录按钮，登录页也重定向回首页。
-                # 此时不能卡在登录上（旧版会空转240秒后直接失败），
-                # 直接用当前会话（本机cookie + WAF通行凭证）继续爬，能不能读正文交给接口回答
-                log_print("⚠️站点当前没有登录入口（首页无登录按钮，登录页也进不去），跳过登录")
-                log_print("   将直接用现有会话继续爬取；若正文接口仍提示需要登录，说明站点改成必须登录又没有入口")
-                log_page_entries(page)
-        safe_sleep(1)
-        cookies = holder.context.cookies()
-        save_cookies_to_file(phone, cookies)
-        return build_session_from_cookies(cookies), holder
-    except Exception:
-        # 复用别人传进来的holder不能由我关掉，交给调用方处理
-        if not reuse:
-            holder.close()
-        raise
-
-
-# ===================== 杂志爬取模块 =====================
-def parse_search_html(html: str):
-    pattern = r'data-href="\/magazine\/detail\/hngymyzyxy_(\d+)\.html\?_=\d+"'
-    match = re.search(pattern, html)
-    if not match:
+        log_print(f"⚠️创建接口请求页面失败: {e}")
         return None
-    return {"resource_id": match.group(1)}
 
 
-def parse_reader_response(resp_text: str):
-    img_urls = []
-    try:
-        data = json.loads(resp_text)
-        if data.get("error") == 0 and "data" in data:
-            image_list = data["data"].get("image_list", [])
-            for img in image_list:
-                img = img.replace("\\", "")
-                img_urls.append(img)
-            return img_urls
-    except json.JSONDecodeError:
-        pass
-    matches = re.findall(r'<img class="slider-img" src="([^"]*0001\.webp)"', resp_text)
-    for m in matches:
-        img_urls.append(m.replace("\\", ""))
-    return img_urls
+class ApiClient:
+    """接口请求封装：优先requests直连；被WAF拦下时自动切到浏览器页面，由页面自己发XHR。
+    2026-10-18 实测：即使cookie是刚登录的，requests直连仍会拿到 200 + HTML 的WAF挑战页，
+    必须靠可见浏览器过一次检测后才能拿到JSON"""
 
+    def __init__(
+        self, session: requests.Session = None,
+        holder: "BrowserHolder" = None, cookies: list = None,
+        limiter: "RateLimiter" = None,
+    ):
+        self.session = session
+        self.holder = holder
+        self.cookies = cookies or []
+        self.limiter = limiter or RateLimiter(API_RATE_PER_MIN, API_BURST)
+        self.pw_page = None
+        self._scratch_page = None  # 跨域图片下载用的备用页面（导航取字节，不受CORS限制）
+        self._tls = threading.local()  # 图片并发下载时每个线程用自己的Session
 
-def fetch_reader_page_text(client, item_id, p: int, headers: dict) -> str:
-    """取阅读器某一页的接口文本。p=1 与 p>1 的URL参数不同——站点前端就是这么发的，
-    照着发才不会被打回"""
-    reader_ts = int(time.time() * 1000)
-    if p == 1:
-        reader_url = f"https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html?&p={p}&_={reader_ts}"
-    else:
-        reader_url = (
-            f"https://web.591adb.cn/magazine/reader/hngymyzyxy_{item_id}.html?"
-            f"item_id={item_id}&uf=0&p={p}&_={reader_ts}"
-        )
-    # 带上headers：浏览器通道不会自动补Referer，只带UA的请求更容易被WAF拦
-    return client.get_text(reader_url, headers=headers)
+    @staticmethod
+    def _looks_blocked(ct: str, body: str) -> bool:
+        """响应是不是被站点安全检测拦了：站点被拦时给的是HTML检测页，
+        正常接口一律返回JSON。所以「Content-Type不是JSON、正文也不像JSON」就按被拦处理"""
+        if "json" in (ct or "").lower():
+            return False
+        return not (body or "").lstrip().startswith(("{", "["))
 
-
-def download_image(url: str, save_path: str, client: ApiClient, max_retry=3, retry_interval=30):
-    """带重试下载图片，失败间隔30秒，最多重试3次；requests失败自动走浏览器通道。
-    每次下载后固定间隔 DOWNLOAD_INTERVAL，控制请求频率"""
-    check_stop()
-    for attempt in range(1, max_retry + 1):
-        check_stop()
-        try:
-            data = client.get_bytes(url)
-            if data is None:
-                raise Exception("下载返回空内容")
-            with open(save_path, "wb") as f:
-                f.write(data)
-            log_print(f"已下载 {os.path.basename(save_path)}")
-            safe_sleep(DOWNLOAD_INTERVAL)
+    def _switch_to_pw(self) -> bool:
+        """切到浏览器通道；没有可用的浏览器就继续留在requests上重试"""
+        if self.pw_page is not None:
             return True
-        except TaskStopped:
-            # 停止信号不能算“下载失败”，更不能被重试逻辑吞掉（否则日志里会
-            # 出现“下载失败: TaskStopped”这种莫名其妙的一行）
+        try:
+            if not ensure_browser(self.holder, self.cookies):
+                return False
+            page = ensure_work_page(self.holder)
+            if page is None:
+                return False
+        except WafChallengeLimit:
             raise
         except Exception as e:
-            log_print(f"下载失败[{attempt}/{max_retry}] {url}: {e}")
-            if attempt >= max_retry:
-                log_print(f"❌该图片多次重试失败，跳过 {url}")
-                return False
-            safe_sleep(retry_interval)
-    return False
+            log_print(f"⚠️启动浏览器通道失败: {e}")
+            return False
+        self.pw_page = page
+        log_print("✅已切换浏览器通道：接口请求改由页面自己发出")
+        return True
+
+    def _scratch(self):
+        """取一个用于下载的备用页面：跨域图片没法用页面内fetch（CORS读不到body），
+        但让浏览器自己导航过去取字节不受CORS限制"""
+        try:
+            if self._scratch_page is not None and not self._scratch_page.is_closed():
+                return self._scratch_page
+        except Exception:
+            pass
+        if self.holder is None or self.holder.context is None:
+            return None
+        try:
+            self._scratch_page = self.holder.context.new_page()
+            return self._scratch_page
+        except Exception as e:
+            log_print(f"⚠️创建下载页面失败: {e}")
+            return None
+
+    def get_text(self, url, headers=None, timeout=30, retries=2) -> str:
+        """对外统一入口：请求频率由 limiter 的令牌桶控制，不再每次固定sleep"""
+        return self.get_text_status(url, headers, timeout, retries)[1]
+
+    def get_text_status(self, url, headers=None, timeout=30, retries=2):
+        """同 get_text，但同时返回HTTP状态码。
+        缩略图接口翻页要用它区分「站点正常回答但没有更多图片」和「请求被拦/出错」。
+        请求频率由 self.limiter 的令牌桶控制，不再每次固定sleep"""
+        return self._request_text_ex(url, headers, timeout, retries)
+
+    def _request_text_ex(self, url, headers=None, timeout=30, retries=2):
+        status = 0
+        for attempt in range(retries + 1):
+            check_stop()
+            self.limiter.acquire()  # 限速在令牌桶里做，不再每次请求后固定sleep
+            # 已切到浏览器通道：所有请求都由常驻页面自己发，不再走requests
+            if self.pw_page is not None:
+                status, body = fetch_text_in_page(self.pw_page, url, headers, timeout)
+                if status == 200 and body.strip() and not self._looks_blocked("", body):
+                    self.limiter.reward()
+                    return status, body
+                if status == 0 and "超时" in (body or ""):
+                    # 请求被站点吊住了：多半是页面里正挂着滑块，重试只会再挂一个请求
+                    log_print("❌接口请求被站点挂起（浏览器窗口里多半正在弹滑块验证）")
+                    return ""
+                if looks_like_login_html(body):
+                    log_print("⚠️浏览器通道返回的是登录页：粘贴的Cookie可能已失效")
+                    return status, body
+                if body and self._looks_blocked("", body):
+                    # 页面自己发的请求也被拦：按限流处理，降速后交给上层重试
+                    self.limiter.penalize()
+                    log_print(f"⚠️浏览器通道被站点拦截 status={status}")
+                    log_print(f"   响应片段: {(body or '')[:200]}")
+                    return status, body
+                log_print(f"⚠️浏览器通道响应异常 status={status}，第{attempt + 1}/{retries + 1}次尝试")
+                log_print(f"   响应片段: {(body or '')[:200]}")
+                if attempt < retries:
+                    safe_sleep(2)
+                continue
+            if self.session is None:
+                log_print("⚠️没有可用的会话（cookie没建起来），无法请求接口")
+                return 0, ""
+            try:
+                resp = self.session.get(url, headers=headers, timeout=timeout)
+                body = resp.text
+                if not self._looks_blocked(resp.headers.get("content-type"), body):
+                    self.limiter.reward()
+                    return resp.status_code, body
+                status = resp.status_code
+                final_url = getattr(resp, "url", url)
+                # 登录页特征可能在改版后消失，所以「最终地址落在 /login/」也算登录失效
+                if looks_like_login_html(body) or "/login/" in (final_url or ""):
+                    # 站点把请求跳到了登录页：这不是WAF，是cookie失效了。
+                    # 重试多少次都是同一个登录页，直接交给上层按「cookie失效」报错
+                    log_print(f"⚠️接口返回的是登录页（最终地址: {final_url}）")
+                    log_print("   → 粘贴的Cookie已失效，请到浏览器重新登录后复制一份新的cookie")
+                    return status, body
+                log_print(f"⚠️requests返回的不是JSON status={resp.status_code}，切浏览器通道")
+                log_print(
+                    f"   最终地址: {final_url}  类型: {resp.headers.get('content-type', '')}"
+                    f"  长度: {len(body or '')}字节"
+                )
+                title = html_title(body)
+                if title:
+                    log_print(f"   页面标题: {title}")
+                # 注意：这里先不降速。requests被WAF挑战是「通道指纹」问题，
+                # 切到浏览器页面通常就正常了；浏览器也拦了才是真的请求太密（见下面）
+                if self._switch_to_pw():
+                    # 换通道后立刻用页面把同一个URL再打一枪，别等下一轮重试
+                    status, body = fetch_text_in_page(self.pw_page, url, headers, timeout)
+                    if status == 200 and body.strip() and not self._looks_blocked("", body):
+                        self.limiter.reward()
+                        return status, body
+                    if status == 0 and "超时" in (body or ""):
+                        log_print("❌接口请求被站点挂起（浏览器窗口里多半正在弹滑块验证）")
+                        return ""
+                    if looks_like_login_html(body):
+                        log_print("⚠️浏览器通道返回的是登录页：粘贴的Cookie可能已失效")
+                        return status, body
+                    # 页面通道也被拦：这才是真正的限流，降速后交给上层重试
+                    self.limiter.penalize()
+                    log_print(f"⚠️浏览器通道响应异常 status={status}")
+                    log_print(f"   响应片段: {(body or '')[:200]}")
+                    return status, body
+                # 没有可用的浏览器通道，requests又被拦：按限流处理
+                self.limiter.penalize()
+                return status, body
+            except (WafChallengeLimit, TaskStopped):
+                raise
+            except Exception as e:
+                status = 0
+                log_print(f"⚠️接口请求异常:{e}")
+            if attempt < retries:
+                log_print(f"   第{attempt + 1}/{retries + 1}次尝试失败，稍后重试")
+            safe_sleep(2)
+        return status, ""
+
+    def _thread_session(self):
+        """图片并发下载时每个线程用自己的Session——requests.Session不是线程安全的。
+        没有cookie列表（离线测试/探测脚本）时退回共享session，由调用方保证串行"""
+        if not self.cookies or self.session is None:
+            return self.session
+        sess = getattr(self._tls, "session", None)
+        if sess is None:
+            sess = build_session_from_cookies(self.cookies)
+            self._tls.session = sess
+        return sess
+
+    def get_bytes(self, url, timeout=30, allow_browser=True):
+        """下载整页原图，返回bytes或None。
+        先requests；被拦/拿到HTML/异常时，再让浏览器导航取字节（跨域限制对导航不适用）。
+        allow_browser=False 用于线程池worker：Playwright对象不能跨线程调用，
+        失败的页由主线程稍后串行重试（见 crawl_magazine_images）"""
+        sess = self._thread_session()
+        if sess is not None:
+            try:
+                resp = sess.get(url, timeout=timeout)
+                ct = (resp.headers.get("content-type") or "").lower()
+                head = resp.content[:64].lstrip().lower()
+                if resp.status_code == 200 and "html" not in ct and not head.startswith(b"<"):
+                    return resp.content
+                log_print(f"⚠️图片下载返回异常 status={resp.status_code} type={ct}")
+            except Exception:
+                pass
+        if not allow_browser:
+            return None
+        log_print("   改用浏览器导航下载")
+        page = self._scratch()
+        if page is None:
+            return None
+        try:
+            resp = page.goto(url, wait_until="load", timeout=timeout * 1000)
+            if resp is None:
+                log_print("⚠️浏览器导航下载失败：没有响应")
+                return None
+            if not resp.ok:
+                log_print(f"⚠️浏览器导航下载失败 status={resp.status}")
+                return None
+            body = resp.body()
+            ct = (resp.headers.get("content-type") or "").lower()
+            if "html" in ct or body[:64].lstrip().lower().startswith(b"<"):
+                log_print("⚠️浏览器导航下载拿到的是网页而不是图片，按失败处理")
+                return None
+            return body
+        except Exception as e:
+            log_print(f"⚠️浏览器导航下载异常:{e}")
+            return None
+
+
+# ===================== 采集地址解析（v2新增） =====================
+SITE_ID_RE = re.compile(r"hngymyzyxy_(\d+)", re.IGNORECASE)
+QUERY_ID_RE = re.compile(r"[?&](?:item_id|resource_id|magazine_id|id)=(\d+)", re.IGNORECASE)
+PATH_ID_RE = re.compile(r"/(\d+)(?:\.html)?(?:[?#]|$)")
+
+
+def parse_collect_address(text: str) -> dict:
+    """从界面粘贴的采集地址里取出站点id，返回 {"id","kind","raw"}，取不到时 id 为空串。
+    kind 是地址类型：
+      past —— 往期(刊期)列表页，地址里的数字本来就是 magazine_id，直接就能用
+      detail / thumblist / reader / number —— 给的是资源id，要先请求一次缩略图接口换成 magazine_id
+    例：https://web.591adb.cn/magazine/detail/hngymyzyxy_1031982.html?_=1792144681 → 1031982"""
+    raw = (text or "").strip()
+    if not raw:
+        return {"id": "", "kind": "", "raw": raw}
+    if raw.isdigit():
+        return {"id": raw, "kind": "number", "raw": raw}
+    kind = ""
+    for key, name in (
+        ("/past/", "past"),
+        ("/detail/", "detail"),
+        ("/thumblist/", "thumblist"),
+        ("/reader/", "reader"),
+    ):
+        if key in raw:
+            kind = name
+            break
+    m = SITE_ID_RE.search(raw) or QUERY_ID_RE.search(raw) or PATH_ID_RE.search(raw)
+    if not m:
+        return {"id": "", "kind": kind, "raw": raw}
+    return {"id": m.group(1), "kind": kind or "unknown", "raw": raw}
+
+# ===================== 缩略图接口分页（v2新增） =====================
+# 返回里这些名字的字段会被当成「页数/数量」候选打印到日志，方便判断能不能直接用总数收尾
+PAGE_HINT_KEYS = (
+    "total_page", "totalpage", "page_total", "page_count", "pagecount",
+    "pages", "page_num", "pagenum", "img_count", "image_count", "total", "count",
+)
+
+
+def image_page_key(url: str) -> str:
+    """图片指纹：取地址最后一段文件名（如 0001.webp）。
+    站点给的图片地址前缀带着每次请求都会变的随机串（同一张图两次请求拿到的hash不同），
+    拿整条URL比对是比不出重复的，只能按文件名比"""
+    return re.split(r"[?#]", url or "", 1)[0].rsplit("/", 1)[-1]
+
+
+def normalize_image_url(url: str) -> str:
+    """规整缩略图接口给的图片地址：去掉JSON里的转义、补全协议头。
+    如果以后发现 item_thumb_list 给的是缩略图（比如地址里带 /200/ 这种尺寸段），
+    在这里按站点规律换成原图即可，其余逻辑都不用动"""
+    url = (url or "").replace("\\", "").strip()
+    if url.startswith("//"):
+        return "https:" + url
+    return url
+
+
+# 站点给的图片地址字段名（实测 2026-10-16 是 thumb_image，其余是站点改版时的备选名）
+THUMB_URL_KEYS = (
+    "thumb_image", "thumb_img", "img", "img_url", "image", "image_url",
+    "url", "src", "thumb", "thumb_url", "path", "pic",
+)
+IMAGE_URL_RE = re.compile(r"\.(?:jpg|jpeg|png|webp|gif|bmp)(?:\?|$)", re.IGNORECASE)
+
+
+def extract_thumb_url(row) -> str:
+    """item_thumb_list 里一项可能是字符串，也可能是对象
+    （实测：{"thumb_image": "https://…/jpg/1.jpg", "page_number": 1}），两种都兼容"""
+    if isinstance(row, str):
+        return normalize_image_url(row)
+    if isinstance(row, dict):
+        for key in THUMB_URL_KEYS:
+            v = row.get(key)
+            if isinstance(v, str) and v.strip():
+                return normalize_image_url(v)
+        # 站点又改字段名时兜底：取第一个像图片地址的字符串值
+        for v in row.values():
+            if isinstance(v, str) and IMAGE_URL_RE.search(v):
+                return normalize_image_url(v)
+    return ""
+
+
+def extract_magazine_name(item_info) -> str:
+    """从 item_info 里取杂志名（取不到返回空串）。
+    实测这个接口给的是 item_name（如「北京纪事」），volume 才是刊期（如「2026年10月第10期」）；
+    其余几个是本工具兼容别处数据时用的备选字段名"""
+    if not isinstance(item_info, dict):
+        return ""
+    for key in ("magazine_name", "magazine_title", "mag_title", "item_name", "name", "title"):
+        v = item_info.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def parse_thumb_list_response(resp_text: str):
+    """解析缩略图接口返回，返回 (图片地址列表, item_info, 错误说明, data原文)。
+    ⚠️能解析出合法JSON时错误说明就是空的——哪怕 item_thumb_list 是空的，
+    那也是站点的正常回答（很可能是「没有更多了」），不是错误，别把它当失败吞掉"""
+    try:
+        obj = json.loads(resp_text)
+    except (json.JSONDecodeError, TypeError):
+        return [], {}, f"返回不是JSON: {(resp_text or '')[:120]}", {}
+    if not isinstance(obj, dict):
+        return [], {}, f"返回结构异常: {(resp_text or '')[:120]}", {}
+    if obj.get("error") not in (0, "0", None):
+        msg = obj.get("msg") or obj.get("message") or ""
+        return [], {}, f"接口返回 error={obj.get('error')} msg={msg}", {}
+    payload = obj.get("data") or {}
+    if not isinstance(payload, dict):
+        return [], {}, f"data字段结构异常: {str(payload)[:120]}", {}
+    item_info = payload.get("item_info") or {}
+    raw_list = payload.get("item_thumb_list") or []
+    urls = []
+    if isinstance(raw_list, list):
+        for row in raw_list:
+            u = extract_thumb_url(row)
+            if u:
+                urls.append(u)
+        if raw_list and not urls:
+            log_print(f"⚠️item_thumb_list有{len(raw_list)}项但解析不出图片地址，样例: {str(raw_list[0])[:200]}")
+    return urls, item_info, "", payload
+
+
+def is_json_text(text: str) -> bool:
+    """响应体是不是合法JSON。用它把「站点明确回答」和「空响应/被拦」分开：
+    合法JSON（哪怕里面写着 error!=0、图片列表为空）都是站点在正常说话，不用重试；
+    空响应、非JSON、非200 才可能是被WAF拦了，值得重试一会儿"""
+    try:
+        json.loads(text)
+        return True
+    except Exception:
+        return False
+
+
+def log_page_hints(payload: dict):
+    """把返回里像「总页数」的字段打到日志（每期只看第一页）。
+    如果日志显示站点确实给了总页数，翻页结束条件就能改成用它判断，比猜「末页返回什么」更准"""
+    hints = []
+
+    def scan(obj, prefix=""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    scan(v, f"{prefix}{k}.")
+                elif str(k).lower() in PAGE_HINT_KEYS and str(v).strip():
+                    hints.append(f"{prefix}{k}={v}")
+        elif isinstance(obj, list):
+            for i, v in enumerate(obj[:2]):
+                scan(v, f"{prefix}[{i}].")
+
+    try:
+        scan(payload)
+    except Exception:
+        return
+    if hints:
+        log_print("   （返回里的页数/数量字段: " + ", ".join(hints[:10]) + "）")
+
+
+def api_headers(referer: str = "") -> dict:
+    """接口请求头：照站点前端发XHR的样子补齐（Accept/Origin/sec-fetch-*）。
+    Referer 传实际采集地址比站点根路径更像浏览器；站点WAF对「请求像不像它自己的前端」很敏感"""
+    headers = dict(SiteConfig.REQ_HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    headers.update(
+        {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://web.591adb.cn",
+            "x-requested-with": "XMLHttpRequest",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "sec-fetch-dest": "empty",
+            "priority": "u=1,i",
+        }
+    )
+    return headers
+
+
+def thumb_list_url(item_id, p: int) -> str:
+    return SiteConfig.THUMBLIST_URL_TMPL.format(
+        item_id=item_id, p=p, ts=int(time.time() * 1000)
+    )
+
+
+def reader_url(item_id, p: int) -> str:
+    """阅读器接口地址：p=1 与 p>1 的参数不同，照 v1(main.py) 和站点前端的样子拼"""
+    ts = int(time.time() * 1000)
+    if p == 1:
+        return SiteConfig.READER_URL_P1_TMPL.format(item_id=item_id, p=p, ts=ts)
+    return SiteConfig.READER_URL_TMPL.format(
+        item_id=item_id, uf=SiteConfig.READER_UF, p=p, ts=ts
+    )
+
+
+def fetch_thumb_list_page(client, item_id, p: int, headers: dict):
+    """取缩略图接口的一页，返回(状态码, 响应文本)。
+    p从1开始递增，一次返回好几页的图片地址（data.item_thumb_list）"""
+    return client.get_text_status(thumb_list_url(item_id, p), headers=headers)
+
+
+def fetch_thumb_page_with_retry(client, item_id, p, headers):
+    """请求一页；没拿到有效响应（空响应/非JSON/error!=0）就重试几轮，返回最后一次的(状态码, 文本)"""
+    last_status, last_body = 0, ""
+    for attempt in range(MAX_THUMB_RETRY + 1):
+        check_stop()
+        last_status, last_body = fetch_thumb_list_page(client, item_id, p, headers)
+        # 站点给了明确回答（合法JSON，哪怕里面写着 error!=0 或图片列表为空）就不再重试，
+        # 只有空响应/非JSON/非200这种可能是被拦的才值得再试
+        if last_status == 200 and is_json_text(last_body):
+            return last_status, last_body
+        if is_no_login_response(last_body) or looks_like_login_html(last_body):
+            # cookie里的登录态被服务端失效了。没有浏览器就没法就地重登，
+            # 只能明确告诉用户去重新粘贴一份cookie（再重试也是一样的结果）
+            return last_status, last_body
+        if attempt < MAX_THUMB_RETRY:
+            _, _, err, _ = parse_thumb_list_response(last_body)
+            reason = err or f"HTTP {last_status}，响应{len(last_body or '')}字节"
+            log_print(f"⚠️p={p} 第{attempt + 1}次没拿到有效响应（{reason}），重试")
+            safe_sleep(3)
+    return last_status, last_body
+
+
+# ===================== 阅读器接口：收集整页原图地址 =====================
+def is_ad_image_url(url: str) -> bool:
+    """广告图：站点把 appAd/readerad_big.jpg 混在每页旁边，必须挑掉（v1 也这么干）"""
+    return "readerad_big.jpg" in url or "/appAd/" in url
+
+
+def fetch_reader_pages(client, item_id, p: int, headers: dict):
+    """阅读器接口：一次返回2页的整页原图地址，返回 (图片地址列表, 错误说明)。
+    错误说明非空表示这次响应不能用。
+    ⚠️p 从1开始、每次+2（站点前端就这么翻：p=1给第1页，p=3给第2、3页）
+    ⚠️与 v1(main.py) 一致走 uf=0：image_list 里一页就是一张整图，不是瓦片"""
+    status, body = client.get_text_status(reader_url(item_id, p), headers=headers)
+    if status != 200 or not (body or "").strip():
+        return [], f"HTTP {status}，响应{len(body or '')}字节"
+    if is_no_login_response(body):
+        return [], "请登录后再做操作"
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        # 兜底：与 v1 一样，万一站点回的是阅读器HTML，从 slider-img 里抠地址
+        html_urls = [
+            m.replace("\\", "")
+            for m in re.findall(
+                r'<img class="slider-img" src="([^"]+\.(?:webp|jpg|jpeg|png))"', body or ""
+            )
+        ]
+        if html_urls:
+            return [u for u in html_urls if not is_ad_image_url(u)], ""
+        return [], f"返回不是JSON: {(body or '')[:120]}"
+    if obj.get("error") not in (0, "0", None):
+        msg = obj.get("msg") or obj.get("message") or ""
+        return [], f"接口返回 error={obj.get('error')} msg={msg}"
+    rows = (obj.get("data") or {}).get("image_list") or []
+    urls = []
+    for row in rows:
+        if isinstance(row, str):
+            u = normalize_image_url(row)
+        elif isinstance(row, dict):
+            # 兜底：站点偶尔把一项包成对象（字段名见 THUMB_URL_KEYS）
+            u = extract_thumb_url(row)
+        elif isinstance(row, list):
+            # uf=0 下不该出现瓦片数组；真出现了就明确报错，别拿残缺页凑PDF
+            return [], "接口仍返回瓦片格式（image_list 是数组套数组），站点可能又改版了，请反馈开发者"
+        else:
+            continue
+        if u and not is_ad_image_url(u):
+            urls.append(u)
+    return urls, ""
+
+
+def walk_reader_pages(
+    client, item_id, want_pages: int, headers: dict, on_new_page=None
+) -> list:
+    """按 p=1,3,5… 把这一期的整页原图地址收集齐，返回按页序排好的地址列表。
+    want_pages 是期望页数(item_info.page_num)，只用来判断什么时候够了；
+    真正停下来的依据是「接口返回的图片与已收集的相同（文件名重复）」——
+    站点翻到头就是重复给已经有的页，这时立即退出循环。
+    on_new_page(page_no, url)：每发现一个新页就回调一次，用于「边收集边下载」"""
+    urls = []
+    seen = set()
+    block_retries = 0
+    p = 1
+    calls = 0
+    while calls < MAX_READER_CALLS:
+        check_stop()
+        calls += 1
+        rows, err = fetch_reader_pages(client, item_id, p, headers)
+        if err:
+            # 403「访问被拦截」/ 返回WAF挑战页 = 请求太密被限流了（不是没数据）。
+            # 这时候丢掉后面的页最亏，停一会儿再试同一页；真等不回来才按已收集到的页继续
+            if (
+                "403" in err or "拦截" in err or "<html" in err.lower()
+            ) and block_retries < MAX_READER_BLOCK_RETRY:
+                block_retries += 1
+                log_print(
+                    f"⚠️疑似被站点限流（{err}），等{READER_BLOCK_WAIT}秒后重试 p={p}"
+                    f"（第{block_retries}/{MAX_READER_BLOCK_RETRY}次）"
+                )
+                safe_sleep(READER_BLOCK_WAIT)
+                calls -= 1  # 等待重试不算进熄火次数
+                continue
+            if not urls:
+                raise Exception(
+                    COOKIE_EXPIRED_MSG if "请登录" in err
+                    else f"阅读器接口第1次请求就失败：{err} " + blocked_hint(err)
+                )
+            log_print(f"⚠️阅读器接口返回异常（{err}），按已收集到的{len(urls)}页继续")
+            break
+        block_retries = 0
+        new_count = 0
+        for u in rows:
+            key = image_page_key(u)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            urls.append(u)
+            new_count += 1
+            if on_new_page is not None:
+                on_new_page(len(urls), u)
+        if new_count:
+            log_print(f"  p={p} 收集到{new_count}页，累计{len(urls)}页")
+        else:
+            # 返回的图片地址/文件名全是已有的 → 站点翻到头了，立即退出
+            log_print(f"  p={p} 返回的图片与已有页相同（文件名重复），判定已到末页，退出循环")
+            break
+        if want_pages and len(urls) >= want_pages:
+            break
+        p += READER_PAGE_STEP
+    return urls
+
+
+PAGE_IMAGE_EXTS = ("webp", "jpg", "jpeg", "png", "gif", "bmp")
+
+
+def page_image_ext(url: str) -> str:
+    """整页原图的扩展名（站点实测给 .webp）；认不出来就按 .jpg 存"""
+    name = image_page_key(url)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return ext if ext in PAGE_IMAGE_EXTS else "jpg"
+
+
+def download_page_image(client, page_no: int, url: str, out_dir: str, allow_browser=True):
+    """下载一页的整页原图，返回文件路径；失败返回None。中途停止会抛 TaskStopped。
+    allow_browser=False 时只走requests（线程池worker里不能碰Playwright）"""
+    check_stop()
+    out_path = os.path.join(out_dir, f"{page_no:04d}.{page_image_ext(url)}")
+    for attempt in range(1, 4):
+        check_stop()
+        data = client.get_bytes(url, allow_browser=allow_browser)
+        if data:
+            with open(out_path, "wb") as f:
+                f.write(data)
+            return out_path
+        log_print(f"⚠️第{page_no}页下载失败[{attempt}/3]：{url}")
+        safe_sleep(2)
+    log_print(f"❌第{page_no}页多次重试失败，跳过这一页")
+    return None
+
+
+def resolve_magazine_id(client, parsed: dict, headers: dict):
+    """把采集地址里的id换成往期列表接口要的 magazine_id，返回 (magazine_id, magazine_name)。
+    /past/ 地址里给的本来就是 magazine_id，直接用；
+    其余（detail/thumblist/reader/纯数字）拿它请求一次缩略图接口，读 data.item_info.magazine_id"""
+    the_id = parsed["id"]
+    if parsed["kind"] == "past":
+        log_print(f"采集地址按往期列表页解析：{the_id} 即 magazine_id")
+        return the_id, ""
+    log_print(f"采集地址里的id={the_id}（{parsed['kind']}），先用缩略图接口换成 magazine_id")
+    status, body = fetch_thumb_page_with_retry(client, the_id, 1, headers)
+    _, item_info, err, _ = parse_thumb_list_response(body)
+    if is_no_login_response(body) or looks_like_login_html(body):
+        raise Exception(
+            COOKIE_EXPIRED_MSG
+            + ("" if is_no_login_response(body) else "（缩略图接口返回的是登录页）")
+        )
+    if err:
+        raise Exception(
+            f"用采集地址里的id={the_id}请求缩略图接口失败：{err} "
+            + (blocked_hint(body) or blocked_hint(err) or "（响应为空，请稍等10~30分钟再试）")
+        )
+    magazine_id = str(item_info.get("magazine_id") or "").strip()
+    if not magazine_id:
+        raise Exception(
+            f"缩略图接口没有返回 magazine_id（id={the_id} 可能不是本站的杂志资源id）。"
+            f"返回片段: {(body or '')[:200]}"
+        )
+    return magazine_id, extract_magazine_name(item_info)
 
 
 def normalize_volume_keyword(part: str) -> str:
@@ -1217,80 +1251,57 @@ def match_volume_rows(raw_year_blocks: list, target_year_set: set, target_volume
 
 def crawl_magazine_images(
     session: requests.Session,
-    keyword: str,
+    collect_addr: str,
     target_year: str,
     target_volume_name_text: str,
     save_root: str,
-    pw_context=None,
-    prefer_pw: bool = False,
-    pw_page=None,
-    relogin=None,
+    holder: "BrowserHolder" = None,
+    cookies: list = None,
 ):
-    """relogin：正文接口报「请登录后再做操作」时调用的重新登录回调（返回是否确认成功）。
-    站点会提前让会话在服务端失效，而本地cookie的时间戳还没到点——只看cookie必然误判，
-    只有正文接口的返回说了算，所以发现没登录态时就地补一次登录，而不是直接失败"""
-    client = ApiClient(session, pw_context, prefer_pw=prefer_pw, pw_page=pw_page)
-    ts = int(time.time() * 1000)
-    search_url = (
-        f"https://web.591adb.cn/search/hngymyzyxy.html?st=1&page_num=1"
-        f"&keywords={requests.utils.quote(keyword)}&withCount=1&ts={ts}"
-    )
-    xml_headers = dict(BrowserConfig.REQ_HEADERS)
-    xml_headers.update(
-        {
-            "x-requested-with": "XMLHttpRequest",
-            "sec-fetch-mode": "cors",
-            "priority": "u=1,i",
-        }
-    )
-    log_print(f"请求搜索接口 {search_url}")
-    search_text = client.get_text(search_url, headers=xml_headers)
-    # 被拦了就直接收手。曾经在这里试过「丢掉WAF凭证重开页面再打一枪」，
-    # 结果是：用户刚滑过的那一页被我们跳走 → 站点立刻再弹一个滑块 → 越滑越多。
-    # 站点一旦盯上这台机器，任何重新跳转都是在给用户找新的验证码
-    if not search_text:
+    """拿到采集地址后：换成 magazine_id → 取往期列表 → 按年份/期数筛选 → 逐期取图。
+    每一期分三步：
+      ① 缩略图接口 p=1：拿这一期的总页数(item_info.page_num)和杂志名
+      ② 阅读器接口按 p=1,3,5… 一页页收集（一次2页，uf=0，与 v1 一致）；
+         接口返回的图片与已收集的相同（文件名重复）就判定到末页，退出循环
+      ③ 逐张下载整页原图
+    requests 被站点WAF拦下时，ApiClient 会自动切到 holder 里的浏览器页面发请求。
+    每下完一期就yield出去，由上层立刻转PDF"""
+    limiter = RateLimiter(API_RATE_PER_MIN, API_BURST)
+    client = ApiClient(session, holder=holder, cookies=cookies, limiter=limiter)
+    # Referer 用实际采集地址：站点WAF会看「请求是不是从对应页面发出来的」
+    xml_headers = api_headers(collect_addr if collect_addr.startswith("http") else "")
+
+    # ===== 1.采集地址 → magazine_id =====
+    parsed = parse_collect_address(collect_addr)
+    if not parsed["id"]:
         raise Exception(
-            "搜索接口请求失败（requests与浏览器通道均失败）：接口返回空响应，多半被站点安全检测拦截。"
-            "若浏览器里首页能正常打开、只有接口失败，就是站点把本次会话的接口请求拦了——"
-            "请关闭浏览器等待10~30分钟后再试，期间不要反复重试（越试越容易被盯上）"
+            f"采集地址里解析不出站点id：{collect_addr}。"
+            "请粘贴形如 https://web.591adb.cn/magazine/detail/hngymyzyxy_1031982.html 的地址"
         )
-    try:
-        search_json = json.loads(search_text)
-    except json.JSONDecodeError:
-        raise Exception(f"搜索接口返回非JSON内容: {search_text[:200]}")
-    if search_json.get("code") != 1:
-        raise Exception(f"搜索接口返回失败: {search_json}")
-    data_section = search_json.get("data", {})
-    html_str = data_section.get("html", "")
-    parse_res = parse_search_html(html_str)
-    if not parse_res:
-        raise Exception("解析不到resource_id")
-    resource_id = parse_res["resource_id"]
-    log_print(f"resource_id={resource_id}")
-    corver_ts = int(time.time() * 1000)
-    cover_url = f"https://web.591adb.cn/magazine/thumblist/hngymyzyxy_{resource_id}.html?p=1&_={corver_ts}"
-    cover_text = client.get_text(cover_url, headers=xml_headers)
-    if not cover_text:
-        raise Exception("获取封面列表请求失败")
-    try:
-        cover_json = json.loads(cover_text)
-    except json.JSONDecodeError:
-        raise Exception(f"封面列表接口返回非JSON内容: {cover_text[:200]}")
-    if cover_json.get("error") != 0:
-        raise Exception("获取封面列表失败")
-    item_info = cover_json.get("data", {}).get("item_info", {})
-    magazine_id = item_info.get("magazine_id")
-    past_ts = int(time.time() * 1000)
-    past_url = f"https://web.591adb.cn/magazine/past/hngymyzyxy_{magazine_id}.html?_={past_ts}"
+    magazine_id, magazine_name = resolve_magazine_id(client, parsed, xml_headers)
+    log_print(f"magazine_id={magazine_id}" + (f" 杂志名:{magazine_name}" if magazine_name else ""))
+
+    # ===== 2.往期(刊期)列表 =====
+    past_url = SiteConfig.PAST_URL_TMPL.format(
+        magazine_id=magazine_id, ts=int(time.time() * 1000)
+    )
+    log_print(f"请求刊期列表 {past_url}")
     past_text = client.get_text(past_url, headers=xml_headers)
     if not past_text:
-        raise Exception("获取刊期列表请求失败")
+        # 被拦了就直接收手。曾经试过「丢掉WAF凭证重开页面再打一枪」，结果是：
+        # 用户刚滑过的那一页被我们跳走 → 站点立刻再弹一个滑块。站点一旦盯上这台机器，
+        # 任何重新跳转都是在给用户找新的验证码
+        raise Exception("获取刊期列表失败：接口无有效响应。" + blocked_hint(past_text))
     try:
         past_json = json.loads(past_text)
     except json.JSONDecodeError:
-        raise Exception(f"刊期列表接口返回非JSON内容: {past_text[:200]}")
+        if looks_like_login_html(past_text):
+            raise Exception(COOKIE_EXPIRED_MSG + "（刊期列表接口返回的是登录页）")
+        raise Exception(
+            f"刊期列表接口返回非JSON内容: {past_text[:200]}" + blocked_hint(past_text)
+        )
     if past_json.get("error") != 0:
-        raise Exception("获取刊期列表失败")
+        raise Exception(f"获取刊期列表失败: {str(past_json)[:200]}")
 
     # 解析多年份：英文逗号分割
     target_year_set = set()
@@ -1326,120 +1337,112 @@ def crawl_magazine_images(
                 log_print(f"   {yb.get('item_year')} 年可用期刊: {vols}")
         return
 
-    relogin_used = 0  # 本次任务已就地重新登录的次数，按**任务**计数（跨刊期累计，见下方 no_login 分支）
-    for item_info in article_info_list:
+    # ===== 3.逐期取图 =====
+    for article in article_info_list:
         check_stop()
-        item_id = item_info.get("item_id")
-        resource_id_item = item_info.get("resource_id")
-        volume = item_info.get("volume", "")
+        item_id = article.get("item_id")
+        resource_id_item = article.get("resource_id")
+        volume = article.get("volume", "")
         log_print(f"找到刊期 {volume} item_id={item_id}")
-        # 修复目录名称：原版 volume_resource_id_item_id（文件名部分清洗非法字符）
+
+        # ① 缩略图接口只要第一页：拿总页数(item_info.page_num)和杂志名。
+        #    不用它当图片源——它给的是 160×225 的缩略图（实测），印成PDF根本看不清字；
+        #    真正的整页原图在阅读器接口那边（uf=0，与 v1 一致）
+        status, body = fetch_thumb_page_with_retry(client, item_id, 1, xml_headers)
+        thumbs, info, err, payload = parse_thumb_list_response(body)
+        if is_no_login_response(body) or looks_like_login_html(body):
+            raise Exception(
+                COOKIE_EXPIRED_MSG
+                + ("" if is_no_login_response(body) else "（缩略图接口返回的是登录页）")
+            )
+        if err or status != 200 or not (body or "").strip():
+            detail = err or f"HTTP {status}，响应{len(body or '')}字节"
+            raise Exception(f"读取该期页数失败（缩略图接口）：{detail} " + blocked_hint(body))
+        name = extract_magazine_name(info)
+        if name and not magazine_name:
+            magazine_name = name
+            log_print(f"（从接口取到杂志名:{magazine_name}）")
+        log_print("   item_info字段: " + ", ".join(list(info.keys())[:20]))
+        log_page_hints(payload)
+        raw_page_num = str(info.get("page_num") or "").strip()
+        want_pages = int(raw_page_num) if raw_page_num.isdigit() else 0
+        log_print(
+            f"该期共{want_pages}页" if want_pages
+            else "接口没给总页数，将按「返回的图片与已有页相同」判断收集结束"
+        )
+
+        mag_dir_name = sanitize_filename_part(magazine_name or f"magazine_{magazine_id}")
         save_dir = os.path.join(
             save_root,
-            sanitize_filename_part(keyword),
+            mag_dir_name,
             f"{sanitize_filename_part(volume)}_{resource_id_item}_{item_id}",
         )
         os.makedirs(save_dir, exist_ok=True)
-        p = 1
-        all_img = []
-        prev_page_key = None  # 上一页的图片指纹：站点翻到头后会一直重复返回最后一页
-        while True:
-            check_stop()
-            reader_text = fetch_reader_page_text(client, item_id, p, xml_headers)
-            # 正文接口是唯一可靠的登录态判据（搜索接口匿名也能通）。
-            # 本地cookie的时间戳没过期、服务端却已让会话失效是常态，
-            # 所以一看到「请登录后再做操作」就地重新登录一次，再重试本页
-            if is_no_login_response(reader_text) and relogin is not None:
-                if relogin_used >= MAX_RELOGIN_PER_RUN:
-                    log_print(f"⚠️本次任务已尝试就地重新登录{relogin_used}次，正文接口仍要求登录，不再重试")
-                else:
-                    relogin_used += 1
-                    log_print(
-                        f"⚠️阅读器接口提示需要登录（本地会话已被服务端失效），"
-                        f"尝试就地重新登录（第{relogin_used}/{MAX_RELOGIN_PER_RUN}次）"
-                    )
-                    try:
-                        ok = bool(relogin())
-                    except (TaskStopped, WafChallengeLimit):
-                        raise
-                    except Exception as e:
-                        ok = False
-                        log_print(f"⚠️重新登录失败: {e}")
-                    if not ok:
-                        # do_login_on_page 靠页面标记判断成功，标记可能已改版，
-                        # 所以没确认成功也照旧打一枪，以接口返回为准
-                        log_print("⚠️未确认登录成功，仍重试当前页（是否登录以接口返回为准）")
-                    safe_sleep(1)
-                    reader_text = fetch_reader_page_text(client, item_id, p, xml_headers)
-            img_list = parse_reader_response(reader_text)
-            # =====广告页只删掉，不能当“翻到头了”的信号=====
-            # 2026-10-08 实测：站点把广告插到了 p=1（正好在正文最前面），
-            # 而旧逻辑“一遇广告就结束分页”会让整期只下载第1页，还照样显示“任务完成”。
-            # 只有整页除了广告没有任何正文时，才算真的翻到头
-            ad_count = 0
-            for i in range(len(img_list) - 1, -1, -1):
-                img_row = img_list[i]
-                if "readerad_big.jpg" in img_row:
-                    log_print(f"[INFO]p={p}有广告页，移除该图片")
-                    del img_list[i]
-                    ad_count += 1
-            if not img_list and ad_count and reader_text.strip():
-                log_print(f"p={p}整页只有广告、没有正文，判定已到末页")
-                break
-            if not img_list:
-                # 未登录/被WAF拦截时接口同样返回200，但内容里没有图片列表。
-                # 必须显式报错，否则会静默变成“无可用图片”，白白跳过整期还不提示原因
-                if is_no_login_response(reader_text):
-                    raise Exception(
-                        "阅读器接口要求登录（返回「请登录后再做操作」）："
-                        + (
-                            f"程序已在同一个浏览器里尝试就地重新登录{relogin_used}次，仍被要求登录；"
-                            if relogin_used
-                            else "本次没有可用的浏览器通道，无法自动登录；"
-                        )
-                        + "请到设置里确认账号/密码是否正确。"
-                        "若日志里出现过「站点当前没有任何登录入口」，说明站点已移除登录入口，请反馈开发者适配"
-                    )
-                if not reader_text:
-                    # 空响应不是「翻完了」——正常的翻完会返回合法JSON（image_list为空）。
-                    # 旧版在这里只警告一句就break，结果整期被当成“无可用图片”静默跳过，
-                    # 用户看到的是“任务完成”，其实一张都没下。必须显式失败
-                    raise Exception(
-                        f"p={p}读取刊期图片失败：接口无有效响应（空响应，多半是被WAF安全检测拦截）。"
-                        "请关闭程序与浏览器，稍等10~30分钟后再试；若反复出现请反馈开发者"
-                    )
-                log_print(f"p={p}无更多图片，结束分页")
-                break
-            # 翻到头之后站点不是返回空，而是**每页都塞一张广告 + 重复返回最后一页**。
-            # 不加这个判断就会一直重复下载同一页，PDF里塞满重复页（2026-10-08 实测：
-            # p=133 拿到0132.webp，之后 135/137/139... 全是广告+同一张0132.webp）
-            page_key = tuple(img_list)
-            if page_key == prev_page_key:
-                log_print(f"p={p} 返回的图片与上一页完全相同（{os.path.basename(img_list[-1])}），"
-                          f"判定已到末页，停止翻页；该页只保留一次")
-                break
-            prev_page_key = page_key
-            all_img.extend(img_list)
-            log_print(f"  >p={p} 获取到图片:{img_list}")
-            # 保险丝：站点要是翻不到头（一直返回新正文），别无限翻下去
-            if p >= MAX_READER_PAGES:
-                log_print(f"⚠️已翻到p={p}，超过单期上限{MAX_READER_PAGES}页，停止翻页")
-                break
-            # =====还原原版 p +=2，重点！！=====
-            p += 2
-            safe_sleep(READER_PAGE_INTERVAL)
-        log_print(f"共获取 {len(all_img)} 张图片")
-        local_paths = []
-        for idx, img_url in enumerate(all_img):
-            check_stop()
-            ext = img_url.split(".")[-1]
-            save_file = os.path.join(save_dir, f"{idx+1:03d}.{ext}")
-            ok = download_image(img_url, save_file, client)
-            if ok:
-                local_paths.append(save_file)
-        # 每下载完1期图片，立即把该期结果yield出去，由上层马上转PDF
-        yield {"volume": volume, "dir": save_dir, "images": local_paths}
 
+        # ②/③ 边收集边下载：阅读器每发现一页就丢进下载线程池。
+        # 接口受令牌桶限速，等待的时间里图片已经在并发下载了（图片在CDN，和接口限速分开）
+        page_results = {}
+        futures = {}
+        failed_pages = []
+
+        def _download_one(page_no, url):
+            return page_no, download_page_image(
+                client, page_no, url, save_dir, allow_browser=False
+            )
+
+        with ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as pool:
+            def on_new_page(page_no, url):
+                fut = pool.submit(_download_one, page_no, url)
+                futures[fut] = (page_no, url)
+
+            # 阅读器接口把每一页的整页原图地址收集齐（一次2页，和 v1 一样走 uf=0）。
+            # 每个图片地址都带CDN签名，签名是「按图片路径」签的，改文件名就失效，
+            # 所以没法只拿封面地址+文件名递增推出其他页，只能按接口返回的地址走。
+            # page_count>0 时 want_pages=用户填的页数，收够就提前停（省掉末尾的空转轮次）
+            page_urls = walk_reader_pages(
+                client, item_id, want_pages, xml_headers, on_new_page=on_new_page
+            )
+            if not page_urls:
+                raise Exception(f"刊期 {volume} 没有收集到任何页面图片（item_id={item_id}）")
+            if want_pages and len(page_urls) != want_pages:
+                log_print(f"⚠️接口说{want_pages}页，实际收集到{len(page_urls)}页")
+                log_print(
+                    "   若日志里出现过「疑似被站点限流」，就是被拦断的——隔十几分钟重跑这一期即可；"
+                    "否则请把日志反馈给开发者"
+                )
+            log_print(f"   第1页地址样例: {page_urls[0]}")
+
+            for fut in as_completed(futures):
+                page_no, url = futures[fut]
+                try:
+                    _, path = fut.result()
+                except TaskStopped:
+                    raise
+                except Exception as e:
+                    log_print(f"❌第{page_no}页处理失败：{e}")
+                    path = None
+                if path:
+                    page_results[page_no] = path
+                    log_print(f"第{page_no}/{len(page_urls)}页 完成 {os.path.basename(path)}")
+                else:
+                    failed_pages.append((page_no, url))
+
+        # 线程池里失败的页，回到主线程串行重试（这里可以用浏览器导航兜底）
+        for page_no, url in sorted(failed_pages):
+            check_stop()
+            path = download_page_image(client, page_no, url, save_dir, allow_browser=True)
+            if path:
+                page_results[page_no] = path
+                log_print(f"第{page_no}/{len(page_urls)}页 重试完成 {os.path.basename(path)}")
+        local_paths = [page_results[k] for k in sorted(page_results)]
+        log_print(f"共获取 {len(local_paths)} 页图片")
+        # 每下完1期图片，立即把该期结果yield出去，由上层马上转PDF
+        yield {
+            "volume": volume,
+            "dir": save_dir,
+            "images": local_paths,
+            "magazine_name": magazine_name,
+        }
 
 # ===================== PDF水印与加密模块 =====================
 def image_to_pdf_bytes(image_path: str) -> BytesIO:
@@ -1581,13 +1584,10 @@ def build_pdf(
         log_print(f"❌写入PDF失败，文件可能被占用 {output_pdf} , error:{e}")
         raise
 
-
 # ===================== 后台任务主逻辑 =====================
 def background_task(
-    chrome_path,
-    phone,
-    password,
-    book_name,
+    cookie_text,
+    collect_addr,
     year_str,
     issue_str,
     watermark_file,
@@ -1596,14 +1596,20 @@ def background_task(
     save_result_dir,
     del_after_pdf=False,
 ):
-    holder = None
+    holder = BrowserHolder()  # 按需启动：requests被WAF拦下才会真的开浏览器
     try:
         TASK_STOP_EVENT.clear()
         reset_waf_challenge_count()
-        save_account(phone, password)
         log_print(f"🚀开始执行任务，数据目录:{DATA_DIR}")
-        session, holder, prefer_pw = get_valid_session(chrome_path, phone, password, book_name)
-        log_print("✅获取Cookie完成，开始爬取杂志图片")
+        log_print(f"采集地址:{collect_addr}")
+
+        # 会话：先用界面粘贴的这份cookie走requests直连；
+        # 站点WAF现在会拦requests（返回HTML挑战页），拦下后自动切浏览器页面发请求
+        cookies = parse_cookie_input(cookie_text)
+        if not cookies:
+            raise Exception("没有可用的Cookie：请把浏览器里的cookie整条粘贴到界面上再执行")
+        log_print(f"使用界面粘贴的Cookie：{describe_cookies(cookies)}")
+        session = build_session_from_cookies(cookies)
 
         # 处理水印文件与页码（提前校验，避免下完图片才发现参数错误）
         wm_page_list = []
@@ -1621,26 +1627,24 @@ def background_task(
 
         # 每下载完1期图片，立即生成该期PDF
         item_count = 0
-        work_page = ensure_work_page(holder) if holder is not None else None
         for item in crawl_magazine_images(
             session=session,
-            pw_context=holder.context if holder is not None else None,
-            pw_page=work_page,  # 接口请求由这个页面自己发（驱动进程发的会被WAF拦）
-            prefer_pw=prefer_pw,
-            keyword=book_name,
+            collect_addr=collect_addr,
             target_year=year_str,
             target_volume_name_text=issue_str,
             save_root=save_result_dir,
-            # 正文接口报「请登录」时就地重新登录：复用同一个浏览器，不开新窗口（换指纹会再弹滑块）
-            relogin=lambda: relogin_in_holder(holder, phone, password),
+            holder=holder,
+            cookies=cookies,
         ):
             item_count += 1
             check_stop()
             img_paths = item["images"]
             vol_name = item["volume"]
+            # 杂志名从接口里取；取不到就用该期目录名兜底（magazine_<id>），保证PDF名和目录对得上
+            mag_name = item.get("magazine_name") or os.path.basename(os.path.dirname(item["dir"]))
             out_pdf = os.path.join(
                 save_result_dir,
-                f"{sanitize_filename_part(book_name)}_{sanitize_filename_part(vol_name)}.pdf",
+                f"{sanitize_filename_part(mag_name)}_{sanitize_filename_part(vol_name)}.pdf",
             )
             if not img_paths:
                 log_print(f"⚠️刊期 {vol_name} 无可用图片，跳过生成PDF")
@@ -1679,23 +1683,20 @@ def background_task(
         log_print(f"\n❌任务异常 {e}")
         log_print(traceback.format_exc())
     finally:
-        # 任务结束后释放浏览器（登录通道的浏览器在爬取期间保持打开，供WAF回退使用）
-        if holder is not None:
-            holder.close()
-
+        # 任务结束后释放浏览器（浏览器通道在爬取期间保持打开，供后续XHR使用）
+        holder.close()
 
 # ===================== GUI主界面 =====================
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("杂志PDF下载工具")
-        self.root.geometry("980x840")
-        self.root.minsize(880, 720)
+        self.root.title("杂志PDF下载工具 v2")
+        self.root.geometry("1020x940")
+        self.root.minsize(900, 780)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.running = False
         self.worker = None
         self.worker_done_flag = False  # 子线程结束时置位，由主线程轮询后更新按钮状态
-        self.accounts = load_accounts()
         self.last_cfg = load_last_config()
         self._setup_styles()
 
@@ -1710,36 +1711,41 @@ class App:
         task_box.columnconfigure(1, weight=1)
         task_box.columnconfigure(4, weight=1)
 
-        self.phone_var = tk.StringVar()
-        self.cb_phone = ttk.Combobox(task_box, textvariable=self.phone_var, width=26)
-        self.cb_phone["values"] = list(self.accounts.keys())
-        self.cb_phone.bind("<<ComboboxSelected>>", self.on_account_select)
-        self.pwd_var = tk.StringVar()
-        self.ent_pwd = ttk.Entry(task_box, textvariable=self.pwd_var, width=26, show="*")
-        ttk.Label(task_box, text="账号 *").grid(row=0, column=0, sticky=tk.E, padx=(0, 8), pady=4)
-        self.cb_phone.grid(row=0, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
-        ttk.Label(task_box, text="密码 *").grid(row=0, column=3, sticky=tk.E, padx=(0, 8), pady=4)
-        self.ent_pwd.grid(row=0, column=4, sticky=tk.EW, pady=4)
-
-        self.bookname_var = tk.StringVar()
-        ent_book = ttk.Entry(task_box, textvariable=self.bookname_var, width=26)
+        # 采集地址：粘贴杂志地址，程序从地址里解析出 magazine_id 再去取年份/期数
+        self.addr_var = tk.StringVar()
+        ent_addr = ttk.Entry(task_box, textvariable=self.addr_var, width=26)
         self.year_var = tk.StringVar()
         ent_year = ttk.Entry(task_box, textvariable=self.year_var, width=26)
-        ttk.Label(task_box, text="书名 *").grid(row=1, column=0, sticky=tk.E, padx=(0, 8), pady=4)
-        ent_book.grid(row=1, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
-        ttk.Label(task_box, text="年份").grid(row=1, column=3, sticky=tk.E, padx=(0, 8), pady=4)
-        ent_year.grid(row=1, column=4, sticky=tk.EW, pady=4)
+        ttk.Label(task_box, text="采集地址 *").grid(row=0, column=0, sticky=tk.E, padx=(0, 8), pady=4)
+        ent_addr.grid(row=0, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
+        ttk.Label(task_box, text="年份").grid(row=0, column=3, sticky=tk.E, padx=(0, 8), pady=4)
+        ent_year.grid(row=0, column=4, sticky=tk.EW, pady=4)
 
         self.issue_var = tk.StringVar()
         ent_issue = ttk.Entry(task_box, textvariable=self.issue_var, width=26)
         self.save_dir_var = tk.StringVar()
         ent_save = ttk.Entry(task_box, textvariable=self.save_dir_var, width=26)
         btn_save = ttk.Button(task_box, text="选择目录", command=self.select_save_dir)
-        ttk.Label(task_box, text="期刊").grid(row=2, column=0, sticky=tk.E, padx=(0, 8), pady=4)
-        ent_issue.grid(row=2, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
-        ttk.Label(task_box, text="保存目录 *").grid(row=2, column=3, sticky=tk.E, padx=(0, 8), pady=4)
-        ent_save.grid(row=2, column=4, sticky=tk.EW, padx=(0, 6), pady=4)
-        btn_save.grid(row=2, column=5, pady=4)
+        ttk.Label(task_box, text="期刊").grid(row=1, column=0, sticky=tk.E, padx=(0, 8), pady=4)
+        ent_issue.grid(row=1, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
+        ttk.Label(task_box, text="保存目录 *").grid(row=1, column=3, sticky=tk.E, padx=(0, 8), pady=4)
+        ent_save.grid(row=1, column=4, sticky=tk.EW, padx=(0, 6), pady=4)
+        btn_save.grid(row=1, column=5, pady=4)
+
+        # Cookie：粘贴浏览器里的cookie，接口请求优先用它直连
+        ttk.Label(task_box, text="Cookie *").grid(row=2, column=0, sticky=tk.NE, padx=(0, 8), pady=(6, 4))
+        self.cookie_text = tk.Text(
+            task_box, height=3, wrap=tk.CHAR, font=("Menlo", 10), relief=tk.SUNKEN, borderwidth=1
+        )
+        self.cookie_text.grid(row=2, column=1, columnspan=5, sticky=tk.EW, pady=(6, 2))
+        ttk.Label(
+            task_box,
+            text="粘贴浏览器里的整条cookie（形如 name=value; name2=value2）。"
+                 "接口请求优先用它直连；被站点安全检测拦下时会自动打开Chrome，"
+                 "用这份cookie由页面发请求（弹滑块时需手动滑一下）。"
+                 "会话失效时日志会提示，重新登录网站复制一份新的再粘进来即可",
+            style="Hint.TLabel",
+        ).grid(row=3, column=1, columnspan=5, sticky=tk.W)
 
         # ===== PDF 设置 =====
         pdf_box = ttk.LabelFrame(root, text=" PDF 设置（选填） ", padding=12)
@@ -1760,14 +1766,8 @@ class App:
 
         self.pdf_pwd_var = tk.StringVar()
         ent_pdf_pwd = ttk.Entry(pdf_box, textvariable=self.pdf_pwd_var, width=26, show="*")
-        self.chrome_path_var = tk.StringVar()
-        ent_chrome = ttk.Entry(pdf_box, textvariable=self.chrome_path_var, width=26)
-        btn_chrome = ttk.Button(pdf_box, text="选择Chrome", command=self.select_chrome)
         ttk.Label(pdf_box, text="权限密码").grid(row=1, column=0, sticky=tk.E, padx=(0, 8), pady=4)
         ent_pdf_pwd.grid(row=1, column=1, sticky=tk.EW, padx=(0, 24), pady=4)
-        ttk.Label(pdf_box, text="Chrome路径").grid(row=1, column=3, sticky=tk.E, padx=(0, 8), pady=4)
-        ent_chrome.grid(row=1, column=4, sticky=tk.EW, padx=(0, 6), pady=4)
-        btn_chrome.grid(row=1, column=5, pady=4)
 
         self.del_after_pdf_var = tk.BooleanVar(value=False)
         chk_del_after_pdf = ttk.Checkbutton(
@@ -1815,34 +1815,31 @@ class App:
 
     def restore_last_config(self):
         cfg = self.last_cfg
-        self.chrome_path_var.set(cfg.get("chrome_path", ""))
         self.save_dir_var.set(cfg.get("save_dir", ""))
-        self.bookname_var.set(cfg.get("book_name", ""))
+        self.addr_var.set(cfg.get("collect_addr", ""))
         self.year_var.set(cfg.get("year", ""))
         self.issue_var.set(cfg.get("issue", ""))
         self.watermark_file_var.set(cfg.get("watermark_file", ""))
         self.watermark_page_var.set(cfg.get("watermark_pages", ""))
         self.pdf_pwd_var.set(cfg.get("pdf_pwd", ""))
         self.del_after_pdf_var.set(bool(cfg.get("del_after_pdf", False)))
+        # 上次粘贴的cookie也一并恢复：站点会话失效时日志会说清，届时重新粘贴一份即可
+        self.cookie_text.delete("1.0", tk.END)
+        self.cookie_text.insert("1.0", cfg.get("cookie_text", ""))
 
     def save_current_ui_config(self):
         cfg = {
-            "chrome_path": self.chrome_path_var.get(),
             "save_dir": self.save_dir_var.get(),
-            "book_name": self.bookname_var.get(),
+            "collect_addr": self.addr_var.get(),
             "year": self.year_var.get(),
             "issue": self.issue_var.get(),
             "watermark_file": self.watermark_file_var.get(),
             "watermark_pages": self.watermark_page_var.get(),
             "pdf_pwd": self.pdf_pwd_var.get(),
             "del_after_pdf": self.del_after_pdf_var.get(),
+            "cookie_text": self.cookie_text.get("1.0", tk.END).strip(),
         }
         save_last_config(cfg)
-
-    def on_account_select(self, event):
-        acc = self.phone_var.get().strip()
-        pwd = self.accounts.get(acc, "")
-        self.pwd_var.set(pwd)
 
     def _initial_dir(self, path_value: str, fallback: str = "~") -> str:
         """从已填路径取初始目录（不存在则用fallback），兼容mac/win"""
@@ -1874,26 +1871,6 @@ class App:
         if d:
             self.save_dir_var.set(d)
 
-    def select_chrome(self):
-        self.root.lift()
-        if sys.platform == "win32":
-            fp = filedialog.askopenfilename(
-                parent=self.root,
-                title="选择chrome.exe",
-                initialdir=self._initial_dir(
-                    self.chrome_path_var.get(), r"C:\Program Files\Google\Chrome\Application"
-                ),
-                filetypes=[("Chrome", "chrome.exe"), ("所有文件", "*.*")]
-            )
-        else:
-            fp = filedialog.askopenfilename(
-                parent=self.root,
-                title="选择Chrome可执行程序",
-                initialdir=self._initial_dir(self.chrome_path_var.get(), "/Applications"),
-            )
-        if fp:
-            self.chrome_path_var.set(fp)
-
     def consume_log(self):
         try:
             while True:
@@ -1912,22 +1889,31 @@ class App:
     def start_task(self):
         if self.running:
             return
-        phone = self.phone_var.get().strip()
-        pwd = self.pwd_var.get().strip()
-        book = self.bookname_var.get().strip()
+        collect_addr = self.addr_var.get().strip()
+        cookie_text = self.cookie_text.get("1.0", tk.END).strip()
         save_dir = self.save_dir_var.get().strip()
         wm_file = self.watermark_file_var.get().strip()
         wm_pages = self.watermark_page_var.get().strip()
         del_after_pdf = self.del_after_pdf_var.get()
 
-        if not phone:
-            messagebox.showerror("校验错误", "账号(手机号)不能为空")
+        if not collect_addr:
+            messagebox.showerror("校验错误", "采集地址不能为空")
             return
-        if not pwd:
-            messagebox.showerror("校验错误", "密码不能为空")
+        if not parse_collect_address(collect_addr)["id"]:
+            messagebox.showerror(
+                "校验错误",
+                "采集地址里解析不出站点ID\n\n请粘贴形如\n"
+                "https://web.591adb.cn/magazine/detail/hngymyzyxy_1031982.html?_=1792144681\n的地址",
+            )
             return
-        if not book:
-            messagebox.showerror("校验错误", "书名不能为空")
+        if not cookie_text:
+            messagebox.showerror("校验错误", "Cookie不能为空\n\n请到浏览器里复制整条cookie粘贴进来")
+            return
+        if not parse_cookie_input(cookie_text):
+            messagebox.showerror(
+                "校验错误",
+                "Cookie解析不出内容\n\n请粘贴形如 name=value; name2=value2 的整条cookie",
+            )
             return
         if not save_dir:
             messagebox.showerror("校验错误", "结果保存目录不能为空")
@@ -1941,13 +1927,6 @@ class App:
             if wm_pages:
                 messagebox.showerror("校验错误", "未选择水印文件，不允许填写水印页码")
                 return
-        chrome_path = self.chrome_path_var.get().strip()
-        if chrome_path and not os.path.exists(chrome_path):
-            if not resolve_chrome_path(""):
-                messagebox.showerror("校验错误", "指定的Chrome路径不存在，且未找到系统Chrome，请重新选择")
-                return
-            # 能找到系统默认Chrome：后台自动使用，并在日志中说明
-
         # 所有参数在这里一次性取出，交给子线程使用：
         # 子线程读Tk变量既不是线程安全的，也可能读到用户运行中途改动的值
         year = self.year_var.get().strip()
@@ -1960,10 +1939,8 @@ class App:
 
         def work_wrapper():
             background_task(
-                chrome_path,
-                phone,
-                pwd,
-                book,
+                cookie_text,
+                collect_addr,
                 year,
                 issue,
                 wm_file,
